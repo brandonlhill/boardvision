@@ -1,0 +1,1 @@
+Within this directory raw weights can be stored.
