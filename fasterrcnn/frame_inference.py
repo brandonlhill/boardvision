@@ -15,7 +15,7 @@ def load_fasterrcnn_model(weights_path, device, model_name='fasterrcnn_resnet50_
     model.to(device).eval()
     return model, CLASSES
 
-def run_fasterrcnn_on_frame(frame, model, CLASSES, device='cpu', threshold=0.3, image_size=None, square_img=False):
+def run_fasterrcnn_on_frame(frame, model, CLASSES, device='cpu', threshold=0.8, image_size=None, square_img=False): # TODO: Rename to detect_frame
     orig_frame = frame.copy()
     frame_height, frame_width = orig_frame.shape[:2]
     RESIZE_TO = image_size if image_size else frame_width

@@ -18,7 +18,7 @@ def load_yolov7_model(weights, device='cpu', img_size=640, trace=True):
     model.eval()
     return model
 
-def detect_frame(frame, model, device='cpu', img_size=640, conf_thres=0.4, iou_thres=0.5, classes=None, agnostic_nms=False):
+def detect_frame(frame, model, device='cpu', img_size=640, conf_thres=0.6, iou_thres=0.5, classes=None, agnostic_nms=False):
     names = model.module.names if hasattr(model, 'module') else model.names
     colors = [[random.randint(0,255) for _ in range(3)] for _ in names]
 
