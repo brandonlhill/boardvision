@@ -165,11 +165,6 @@ def iou(boxA: List[int], boxB: List[int]) -> float:
     boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
     return interArea / float(boxAArea + boxBArea - interArea)
 
-# (Keeping your old _voter_merge around if needed; adding a clear deprecation log instead of a decorator)
-def _voter_merge(*args, **kwargs):
-    LOGGER.warning("_voter_merge is deprecated; use voter_merge instead.")
-    return voter_merge(*args, **kwargs)
-
 def voter_merge(
     yolo_results: List[Dict[str, Any]],
     frcnn_results: List[Dict[str, Any]],

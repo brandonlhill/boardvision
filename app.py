@@ -42,7 +42,7 @@ from PySide6.QtWidgets import QSizePolicy
 from rich.logging import RichHandler
 
 ################### NOTE ###################
-# TODO: Thread inferencing
+# TODO: Multi-Threading support (thread inference) 
 # TODO: Implement stream handler: given a video stream, buffer the stream (use a python lib to determine the best frames to inference on [reduce infernece costs], then send the frames to the inference engine)
 # TODO: Clean up the hacky drop down
 # TODO: Update the requirements.txt to reflect the new packages imported by this GUI
