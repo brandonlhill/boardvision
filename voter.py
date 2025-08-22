@@ -1,40 +1,31 @@
 # ALGO:
 """
-The improved voter algorithm is designed to intelligently combine the results of two object 
-detection models (YOLOv7 and Faster R-CNN) for each frame of a video. For every detection, it
- first attempts to match bounding boxes from both models by class name and by measuring their 
- overlap using the Intersection over Union (IoU) metric. When both models predict the same 
- class for the same region (i.e., their bounding boxes overlap significantly), the algorithm 
- compares the F1 scores of each model for that class (from a configuration file) and selects 
- the detection from the model with the higher F1 score, provided the model's confidence for 
- that detection is above a certain threshold. The "winning" detection is then displayed as 
- the final decision in the voter output.
+Voter Algorithm: For each detection, bounding boxes from both models are matched by class and overlap (IoU). 
+When the same class is predicted for the same region, class F1 scores (from the config) are compared. The box
+from the higher-F1 model is selected if its confidence exceeds a threshold, and it is shown as the final output.
 
-If a bounding box is detected by only one model (meaning there is no significant overlap with
- any box from the other model), the algorithm checks whether the F1 score for the detecting 
- model is greater than that of the other model for the predicted class and whether the 
- detection's confidence is sufficiently high. Additionally, to allow for close contests, 
- if the F1 scores of both models are within 5% of each other, and the detection's confidence
-  is above 0.95, the algorithm will accept and display this detection as well.
+If a box is produced by only one model (no significant overlap), its class F1 is compared with the other models 
+F1. The detection is accepted if the detecting models F1 is higher and its confidence is high. If F1 scores 
+differ by <=5% and confidence is ≥0.95, the detection is also accepted.
 
-Visually, all candidate detections from YOLOv7 and Faster R-CNN are shown on the “VOTER” output
- panel with color-coding (orange for YOLOv7, blue for Faster R-CNN), while the final chosen 
- bounding boxes—those that “win” according to the above rules—are highlighted in bold yellow 
- and labeled as "FINAL." This ensures that, for every region and class, the most reliable model
-  is trusted, but also allows very confident outlier predictions to be included, resulting in 
-  an ensemble that combines both models' strengths with explainable logic.
+On the VOTER panel, all candidate boxes from YOLOv7 (orange) and Faster R-CNN (blue) are displayed. Boxes 
+chosen by these rules are highlighted in bold yellow and labeled FINAL. An explainable ensemble is thus f
+ormed that favors the most reliable model while allowing very confident outliers.
 """
-
 
 import json
 import cv2
 import numpy as np
+import json
+import logging
+import cv2
+import numpy as np
+from typing import List, Dict, Tuple, Any
 
-def load_f1_config(config_path="config.json"):
-    with open(config_path) as f:
-        return json.load(f)
+LOGGER = logging.getLogger("boardvision.voter")
 
-def iou(boxA, boxB):
+@DeprecationWarning
+def _iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
@@ -131,18 +122,6 @@ def _voter_merge(yolo_results, frcnn_results, f1_config, conf_thresh=0.5, iou_th
 
     return final_boxes, candidates
 
-# voter.py (logging-enhanced)
-
-import json
-import logging
-import cv2
-import numpy as np
-from typing import List, Dict, Tuple, Any
-
-LOGGER = logging.getLogger("boardvision.voter")
-
-# Keep the docstring/spec you wrote (omitted here for brevity)
-
 def load_f1_config(config_path: str = "config.json") -> Dict[str, Dict[str, float]]:
     with open(config_path) as f:
         cfg = json.load(f)
@@ -169,12 +148,12 @@ def voter_merge(
     yolo_results: List[Dict[str, Any]],
     frcnn_results: List[Dict[str, Any]],
     f1_config: Dict[str, Dict[str, float]],
-    conf_thresh: float = 0.50,      # base acceptance threshold when no special rule applies
-    solo_strong: float = 0.90,      # "always wins if solo" threshold
-    iou_thresh: float = 0.40,       # requested overlap for agreement
-    f1_margin: float = 0.05,        # keep close-F1 exception
-    gamma: float = 1.5,             # boosts high-confidence a bit when scoring
-    fuse_coords: bool = True        # if True, do score-weighted box fusion on agreement
+    conf_thresh: float = 0.50,      # Base acceptance threshold when no special rule applies
+    solo_strong: float = 0.95,      # Always wins if solo" threshold
+    iou_thresh: float = 0.40,       # Requested overlap for agreement
+    f1_margin: float = 0.05,        # Keep close-F1 exception
+    gamma: float = 1.5,             # Boosts high-confidence a bit when scoring
+    fuse_coords: bool = True        # If True, do score-weighted box fusion on agreement
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Improved voter with detailed logging.
@@ -213,7 +192,7 @@ def voter_merge(
     y_used = [False] * len(yolo_ann)
     f_used = [False] * len(frc_ann)
 
-    # [1] Agreement pairing by class + IoU ≥ iou_thresh
+    # Step 1: agreement pairing by class + IoU >= iou_thresh
     for i, yd in enumerate(yolo_ann):
         best_j, best_iou = -1, 0.0
         for j, fd in enumerate(frc_ann):
@@ -256,7 +235,7 @@ def voter_merge(
                 i, det_str(yd), best_iou, iou_thresh
             )
 
-    # [2]Solo (unmatched) YOLO boxes
+    # Step 2: solo (unmatched) YOLO boxes
     for i, yd in enumerate(yolo_ann):
         if y_used[i]:
             continue
@@ -279,7 +258,7 @@ def voter_merge(
         else:
             LOGGER.debug("[YOLO SOLO REJECT] %s", det_str(yd))
 
-    # [3] Solo (unmatched) FRCNN boxes
+    # Step 3: solo (unmatched) FRCNN boxes
     for j, fd in enumerate(frc_ann):
         if f_used[j]:
             continue

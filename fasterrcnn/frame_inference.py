@@ -15,7 +15,7 @@ def load_fasterrcnn_model(weights_path, device, model_name='fasterrcnn_resnet50_
     model.to(device).eval()
     return model, CLASSES
 
-def run_fasterrcnn_on_frame(frame, model, CLASSES, device='cpu', threshold=0.8, image_size=None, square_img=False): # TODO: Rename to detect_frame
+def run_fasterrcnn_on_frame(frame, model, CLASSES, device='cpu', conf_thresh=0.8, image_size=None, square_img=False): # TODO: Rename to detect_frame
     orig_frame = frame.copy()
     frame_height, frame_width = orig_frame.shape[:2]
     RESIZE_TO = image_size if image_size else frame_width
@@ -36,7 +36,7 @@ def run_fasterrcnn_on_frame(frame, model, CLASSES, device='cpu', threshold=0.8, 
     detections = []
     if len(outputs[0]['boxes']) != 0:
         draw_boxes, pred_classes, scores = convert_detections(
-            outputs, threshold, CLASSES, {'no_labels': False, 'classes': None, 'track': False}
+            outputs, conf_thresh, CLASSES, {'no_labels': False, 'classes': None, 'track': False}
         )
         # Scale boxes back to original frame size if resized
         draw_boxes_scaled = []

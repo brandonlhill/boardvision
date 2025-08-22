@@ -4,3 +4,4 @@ sample/
 __pycache__
 test
 test_video.mp4
+*.log

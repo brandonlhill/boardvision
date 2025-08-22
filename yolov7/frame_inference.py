@@ -18,7 +18,7 @@ def load_yolov7_model(weights, device='cpu', img_size=640, trace=True):
     model.eval()
     return model
 
-def detect_frame(frame, model, device='cpu', img_size=640, conf_thres=0.6, iou_thres=0.5, classes=None, agnostic_nms=False):
+def detect_frame(frame, model, device='cpu', img_size=640, conf_thresh=0.6, iou_thres=0.5, classes=None, agnostic_nms=False):
     names = model.module.names if hasattr(model, 'module') else model.names
     colors = [[random.randint(0,255) for _ in range(3)] for _ in names]
 
@@ -35,7 +35,7 @@ def detect_frame(frame, model, device='cpu', img_size=640, conf_thres=0.6, iou_t
     detections = []
     with torch.no_grad():
         pred = model(img_tensor)[0]
-        pred = non_max_suppression(pred, conf_thres, iou_thres, classes=classes, agnostic=agnostic_nms)
+        pred = non_max_suppression(pred, conf_thresh, iou_thres, classes=classes, agnostic=agnostic_nms)
     det = pred[0]
 
     if det is not None and len(det):

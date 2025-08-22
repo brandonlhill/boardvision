@@ -26,7 +26,7 @@ def detect(
     weights='yolov7.pt',
     source='inference/images',
     img_size=640,
-    conf_thres=0.4,
+    conf_thres=0.6,
     iou_thres=0.5,
     device='',
     view_img=False,
