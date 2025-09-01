@@ -381,7 +381,7 @@ class VideoInferenceWindow(QMainWindow):
         except Exception:
             self.v_fuse_coords = str(s.value("voter/params/fuse_coords", self.v_fuse_coords)).lower() in ("1","true","yes","on")
 
-        # Model-level thresholds (persist)  ⬅️ new
+        # Model-level thresholds (persist)
         self.m_yolo_conf  = _f("model/yolov7/conf_thresh", self.m_yolo_conf)
         self.m_frcnn_conf = _f("model/frcnn/conf_thresh",  self.m_frcnn_conf)
 
@@ -479,10 +479,31 @@ class VideoInferenceWindow(QMainWindow):
         self.statusBar().showMessage("Voter parameters reset to defaults.")
 
     def _browse_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv);;All Files (*)", options=self._file_dialog_options())
-        if path:
-            self.settings_dock.le_file.setText(path)
-            self.statusBar().showMessage(f"Selected file: {os.path.basename(path)} - Device: {self.device}")
+        from PySide6.QtWidgets import QFileDialog
+
+        media_filter = (
+            "Media Files (*.mp4 *.avi *.mov *.mkv "
+            "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
+        )
+        video_filter = "Video Files (*.mp4 *.avi *.mov *.mkv)"
+        image_filter = "Image Files (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
+        all_filter   = "All Files (*)"
+
+        dlg = QFileDialog(self, "Select Video or Image")
+        dlg.setOptions(self._file_dialog_options())
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        dlg.setNameFilters([media_filter, video_filter, image_filter, all_filter])
+        dlg.selectNameFilter(media_filter)
+
+        if dlg.exec():
+            path = dlg.selectedFiles()[0]
+            if path:
+                self.settings_dock.le_file.setText(path)
+                self.statusBar().showMessage(
+                    f"Selected: {os.path.basename(path)} - Device: {self.device}"
+                )
+
+
 
     def _browse_config(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select Config JSON", "", "JSON (*.json);;All Files (*)", options=self._file_dialog_options())
@@ -611,9 +632,22 @@ class VideoInferenceWindow(QMainWindow):
     def _start_inference(self) -> None:
         if self.is_running:
             return
-        if self.source_mode == "file" and not self.video_path:
-            QMessageBox.warning(self, "No Source", "Pick a file in the Settings panel.")
-            return
+
+        if self.source_mode == "file":
+            if not self.video_path:
+                QMessageBox.warning(self, "No Source", "Pick a file in the Settings panel.")
+                return
+            # If it's an image, do a single pass and return
+            if self._is_image_path(self.video_path):
+                img = cv2.imread(self.video_path)
+                if img is None:
+                    QMessageBox.critical(self, "Error", f"Failed to read image:\n{self.video_path}")
+                    return
+                self._clear_panel_logs()
+                LOGGER.info("Running single-image inference on %s", self.video_path)
+                self._run_inference_on_image(img)
+                return
+
         if self.source_mode == "stream" and not self.stream_spec:
             QMessageBox.warning(self, "No Source", "Enter a stream in the Settings panel.")
             return
@@ -635,6 +669,7 @@ class VideoInferenceWindow(QMainWindow):
         src_desc = self.video_path if self.source_mode == "file" else f"stream:{self.stream_spec}"
         LOGGER.info("Starting inference on %s", src_desc)
         self.timer.start()
+
 
     def _stop_inference(self) -> None:
         if not self.is_running:
@@ -664,7 +699,7 @@ class VideoInferenceWindow(QMainWindow):
             if self.source_mode == "file":
                 self._stop_inference()
                 QMessageBox.information(self, "Info", "End of video.")
-                LOGGER.info("Reached end of video after.")
+                LOGGER.info("Reached end of video after %d frames.", self.frame_index)
             else:
                 LOGGER.warning("Stream read() failed; will retry…")
             return
@@ -808,6 +843,84 @@ class VideoInferenceWindow(QMainWindow):
             except Exception: return 0
         return f"fused={_safe_len(final_boxes)} (candidates={_safe_len(candidates)})"
 
+    def _is_image_path(self, p: str) -> bool:
+        ext = os.path.splitext(p)[1].lower()
+        return ext in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+    def _run_inference_on_image(self, frame_bgr: np.ndarray) -> None:
+        """Run one full pass on a single BGR image and update the three panels."""
+        idx = 0  # single-shot
+
+        # Fresh stats for a single pass
+        self.stats_yolo = RollingStats(1)
+        self.stats_frcnn = RollingStats(1)
+        self.stats_decision = RollingStats(1)
+
+        # YOLOv7
+        t0 = time.perf_counter()
+        yolo_img, yolo_dets = detect_frame(
+            frame_bgr.copy(),
+            model=self.yolov7_model,
+            device=self.device,
+            conf_thresh=self.m_yolo_conf,
+        )
+        t1 = time.perf_counter(); yolo_dt = t1 - t0
+        self.stats_yolo.add(yolo_dt)
+        yolo_summary = self._summarize_dets(yolo_dets)
+        self.panel_yolo.append_log(f"#{idx:05d} {yolo_summary}  [{human_ms(yolo_dt)}]")
+        self.panel_yolo.set_stats(self.stats_yolo.avg_ms, 0.0)
+
+        # Faster R-CNN
+        t0 = time.perf_counter()
+        frcnn_img, frcnn_dets = run_fasterrcnn_on_frame(
+            frame_bgr.copy(),
+            model=self.frcnn_model,
+            CLASSES=self.frcnn_classes,
+            device=self.device,
+            conf_thresh=self.m_frcnn_conf,
+        )
+        t1 = time.perf_counter(); frcnn_dt = t1 - t0
+        self.stats_frcnn.add(frcnn_dt)
+        frcnn_summary = self._summarize_dets(frcnn_dets, class_names=self.frcnn_classes)
+        self.panel_frcnn.append_log(f"#{idx:05d} {frcnn_summary}  [{human_ms(frcnn_dt)}]")
+        self.panel_frcnn.set_stats(self.stats_frcnn.avg_ms, 0.0)
+
+        # Voter / Decision
+        t0 = time.perf_counter()
+        final_boxes, candidates = self.fn_voter_merge(
+            yolo_dets,
+            frcnn_dets,
+            self.cfg_thresholds,
+            conf_thresh=self.v_conf_thresh,
+            solo_strong=self.v_solo_strong,
+            iou_thresh=self.v_iou_thresh,
+            f1_margin=self.v_f1_margin,
+            gamma=self.v_gamma,
+            fuse_coords=self.v_fuse_coords,
+        )
+        voter_img = self.fn_draw_voter_boxes_on_frame(frame_bgr.copy(), final_boxes, candidates)
+        t1 = time.perf_counter(); voter_dt = t1 - t0
+        decision_dt = yolo_dt + frcnn_dt + voter_dt
+        self.stats_decision.add(decision_dt)
+
+        voter_summary = self._summarize_voter(final_boxes, candidates)
+        self.panel_voter.append_log(
+            f"#{idx:05d} {voter_summary}  [voter={human_ms(voter_dt)}; decision={human_ms(decision_dt)}]"
+        )
+        self.panel_voter.set_stats(self.stats_decision.avg_ms, 0.0)
+
+        # Labels & display
+        yolo_img  = self.fn_overlay_label(yolo_img,  "YOLOv7",      color=(0, 128, 255))
+        frcnn_img = self.fn_overlay_label(frcnn_img, "Faster R-CNN", color=(255, 128, 0))
+        voter_img = self.fn_overlay_label(voter_img, "Decision",     color=(0, 255, 255))
+        self._display_image(self.panel_yolo.video,  yolo_img)
+        self._display_image(self.panel_voter.video, voter_img)
+        self._display_image(self.panel_frcnn.video, frcnn_img)
+
+        self.statusBar().showMessage(
+            f"Image inference complete | YOLO {human_ms(yolo_dt)} | FRCNN {human_ms(frcnn_dt)} | Voter {human_ms(voter_dt)} | Device: {self.device}"
+        )
+
 
 def main() -> int:
     app = QApplication(sys.argv)
@@ -821,7 +934,7 @@ def main() -> int:
     win = VideoInferenceWindow()
     win.show()
 
-    if sys.platform.startswith("win"): # Helps fix DWMAPI issues
+    if sys.platform.startswith("win"): # Helps
         try:
             import ctypes
             hwnd = int(win.winId())

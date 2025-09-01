@@ -5,3 +5,5 @@ __pycache__
 test
 test_video.mp4
 *.log
+voter_fine_tune.py
+evaluator.py

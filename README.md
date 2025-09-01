@@ -19,8 +19,11 @@ Voter Parameters
 - Lower gamma (e.g. 0.5–1.0): the voter treats lower confidence detections more leniently, leading to more fused boxes overall.
 - Default (1.5 in your code): a moderate bias towards stronger detections, while still considering weaker ones if they align well.
 
-################### NOTE ###################
-# TODO: Multi-Threading support (thread inference) 
-# TODO: Update the requirements.txt to reflect the new packages imported by this GUI
-# TODO: Cache the video feed for playback and the boundboxes for analysis, perhaps add and analysis pane.  
-# TODO: Make the inference render boxes be the same
+################### TODOS ###################
+- Refactor: Split the codebase, it's a monolith
+- Multi-Threading support (thread inference) 
+- Update the requirements.txt to reflect the new packages imported by this GUI
+- Cache the video feed for playback and the boundboxes for analysis, perhaps add and analysis pane
+- Make the inference render boxes be the same
+- Add toggle to disable the box render for Dscision frame, and voter class
+- And abiltiy to "pause" inference (the image video upload can become a video stream into the inference engine)
