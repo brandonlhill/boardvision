@@ -1,0 +1,46 @@
+{
+  "CPU_FAN_NO_Screws": {
+    "FRCNN": 0.000,
+    "YOLOv7": 0.234
+  },
+  "CPU_FAN_Screw_loose": {
+    "FRCNN": 0.000,
+    "YOLOv7": 0.000
+  },
+  "CPU_FAN_Screws": {
+    "FRCNN": 0.000,
+    "YOLOv7": 0.000
+  },
+  "CPU_fan": {
+    "FRCNN": 0.987,
+    "YOLOv7": 0.987
+  },
+  "CPU_fan_port": {
+    "FRCNN": 0.091,
+    "YOLOv7": 0.250
+  },
+  "CPU_fan_port_detached": {
+    "FRCNN": 0.000,
+    "YOLOv7": 0.000
+  },
+  "Incorrect_Screws": {
+    "FRCNN": 0.000,
+    "YOLOv7": 0.000
+  },
+  "Loose_Screws": {
+    "FRCNN": 0.333,
+    "YOLOv7": 0.000
+  },
+  "No_Screws": {
+    "FRCNN": 0.172,
+    "YOLOv7": 0.157
+  },
+  "Scratch": {
+    "FRCNN": 0.462,
+    "YOLOv7": 0.182
+  },
+  "Screws": {
+    "FRCNN": 0.222,
+    "YOLOv7": 0.473
+  }
+}

@@ -38,89 +38,6 @@ def _iou(boxA, boxB):
     iou_val = interArea / float(boxAArea + boxBArea - interArea)
     return iou_val
 
-@DeprecationWarning
-def _voter_merge(yolo_results, frcnn_results, f1_config, conf_thresh=0.5, iou_thresh=0.5, f1_margin=0.05):
-    yolo_used = [False] * len(yolo_results)
-    frcnn_used = [False] * len(frcnn_results)
-    final_boxes = []
-
-    # Candidate boxes for debugging/drawing
-    candidates = []
-
-    # Step 1: Match overlapping detections by class and IoU
-    for i, y_det in enumerate(yolo_results):
-        best_iou = 0
-        best_j = -1
-        for j, f_det in enumerate(frcnn_results):
-            if y_det['label'] == f_det['label']:
-                curr_iou = iou(y_det['bbox'], f_det['bbox'])
-                if curr_iou > best_iou:
-                    best_iou = curr_iou
-                    best_j = j
-        if best_iou > iou_thresh:
-            class_name = y_det['label']
-            f1_yolo = f1_config[class_name]["YOLOv7"]
-            f1_frcnn = f1_config[class_name]["FRCNN"]
-            yolo_box = dict(y_det)
-            yolo_box['source'] = "YOLOv7"
-            frcnn_box = dict(frcnn_results[best_j])
-            frcnn_box['source'] = "FasterRCNN"
-            candidates.append(yolo_box)
-            candidates.append(frcnn_box)
-            # Winner based on higher F1
-            if f1_yolo >= f1_frcnn:
-                if y_det['conf'] > conf_thresh:
-                    winner = dict(y_det)
-                    winner['source'] = "FINAL"
-                    final_boxes.append(winner)
-            else:
-                if frcnn_results[best_j]['conf'] > conf_thresh:
-                    winner = dict(frcnn_results[best_j])
-                    winner['source'] = "FINAL"
-                    final_boxes.append(winner)
-            yolo_used[i] = True
-            frcnn_used[best_j] = True
-
-    # Step 2: Handle unmatched YOLO boxes
-    for i, y_det in enumerate(yolo_results):
-        if not yolo_used[i]:
-            class_name = y_det['label']
-            f1_yolo = f1_config[class_name]["YOLOv7"]
-            f1_frcnn = f1_config[class_name]["FRCNN"]
-            # F1 margin logic
-            if f1_yolo > f1_frcnn and y_det['conf'] > conf_thresh:
-                winner = dict(y_det)
-                winner['source'] = "FINAL"
-                final_boxes.append(winner)
-                candidates.append(dict(y_det, source="YOLOv7"))
-            elif abs(f1_yolo - f1_frcnn) < f1_margin and y_det['conf'] > 0.95:
-                winner = dict(y_det)
-                winner['source'] = "FINAL"
-                final_boxes.append(winner)
-                candidates.append(dict(y_det, source="YOLOv7"))
-            else:
-                candidates.append(dict(y_det, source="YOLOv7"))
-
-    # Step 3: Handle unmatched FRCNN boxes
-    for j, f_det in enumerate(frcnn_results):
-        if not frcnn_used[j]:
-            class_name = f_det['label']
-            f1_yolo = f1_config[class_name]["YOLOv7"]
-            f1_frcnn = f1_config[class_name]["FRCNN"]
-            if f1_frcnn > f1_yolo and f_det['conf'] > conf_thresh:
-                winner = dict(f_det)
-                winner['source'] = "FINAL"
-                final_boxes.append(winner)
-                candidates.append(dict(f_det, source="FasterRCNN"))
-            elif abs(f1_frcnn - f1_yolo) < f1_margin and f_det['conf'] > 0.95:
-                winner = dict(f_det)
-                winner['source'] = "FINAL"
-                final_boxes.append(winner)
-                candidates.append(dict(f_det, source="FasterRCNN"))
-            else:
-                candidates.append(dict(f_det, source="FasterRCNN"))
-
-    return final_boxes, candidates
 
 def load_f1_config(config_path: str = "config.json") -> Dict[str, Dict[str, float]]:
     with open(config_path) as f:
@@ -153,17 +70,26 @@ def voter_merge(
     iou_thresh: float = 0.40,       # Requested overlap for agreement
     f1_margin: float = 0.05,        # Keep close-F1 exception
     gamma: float = 1.5,             # Boosts high-confidence a bit when scoring
-    fuse_coords: bool = True        # If True, do score-weighted box fusion on agreement
+    fuse_coords: bool = True,        # If True, do score-weighted box fusion on agreement
+    near_tie_conf=9.95,
+    use_f1: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Improved voter with detailed logging.
     """
-
-    def score(det: Dict[str, Any], model_name: str) -> float:
-        cls = det['label']
-        f1 = float(f1_config.get(cls, {}).get('YOLOv7' if model_name == 'YOLOv7' else 'FRCNN', 0.0))
+    def score(det, model_name):
         conf = max(0.0, float(det.get('conf', 0.0)))
-        return (conf ** gamma) * f1
+        base = conf ** gamma
+        if use_f1:
+            cls = det['label']
+            f1 = float(f1_config.get(cls, {}).get('YOLOv7' if model_name == 'YOLOv7' else 'FRCNN', 0.0))
+            base *= f1
+        return base
+    # def score(det: Dict[str, Any], model_name: str) -> float:
+    #     cls = det['label']
+    #     f1 = float(f1_config.get(cls, {}).get('YOLOv7' if model_name == 'YOLOv7' else 'FRCNN', 0.0))
+    #     conf = max(0.0, float(det.get('conf', 0.0)))
+    #     return (conf ** gamma) * f1
 
     def fuse_box(a: List[int], b: List[int], wa: float, wb: float) -> List[int]:
         denom = max(wa + wb, 1e-9)
@@ -237,26 +163,43 @@ def voter_merge(
 
     # Step 2: solo (unmatched) YOLO boxes
     for i, yd in enumerate(yolo_ann):
-        if y_used[i]:
+        if y_used[i]: continue
+        conf = float(yd.get('conf', 0.0))
+        if not use_f1:
+            if conf >= solo_strong or conf >= conf_thresh:
+                final_boxes.append(dict(yd, source='FINAL'))
             continue
+        # original F1-based branches:
         cls = yd['label']
         f1_y = float(f1_config.get(cls, {}).get('YOLOv7', 0.0))
         f1_f = float(f1_config.get(cls, {}).get('FRCNN', 0.0))
-        conf = float(yd.get('conf', 0.0))
-
         if conf >= solo_strong:
             final_boxes.append(dict(yd, source='FINAL'))
-            LOGGER.debug("[YOLO SOLO STRONG] %s (>= %.2f) -> FINAL", det_str(yd), solo_strong)
-        elif f1_y > f1_f and conf >= conf_thresh:
+        elif f1_y > f1_f and conf >= conf_thresh:                      # F1 advantage:contentReference[oaicite:0]{index=0}
             final_boxes.append(dict(yd, source='FINAL'))
-            LOGGER.debug("[YOLO F1 ADVANTAGE] %s (f1_y=%.3f > f1_f=%.3f, conf>=%.2f) -> FINAL",
-                         det_str(yd), f1_y, f1_f, conf_thresh)
-        elif abs(f1_y - f1_f) <= f1_margin and conf >= 0.95:
+        elif abs(f1_y - f1_f) <= f1_margin and conf >= near_tie_conf:  # near-tie fallback:contentReference[oaicite:1]{index=1}
             final_boxes.append(dict(yd, source='FINAL'))
-            LOGGER.debug("[YOLO CLOSE-F1 HI-CONF] %s (|ΔF1|<=%.2f, conf>=0.95) -> FINAL",
-                         det_str(yd), f1_margin)
-        else:
-            LOGGER.debug("[YOLO SOLO REJECT] %s", det_str(yd))
+    # for i, yd in enumerate(yolo_ann):
+    #     if y_used[i]:
+    #         continue
+    #     cls = yd['label']
+    #     f1_y = float(f1_config.get(cls, {}).get('YOLOv7', 0.0))
+    #     f1_f = float(f1_config.get(cls, {}).get('FRCNN', 0.0))
+    #     conf = float(yd.get('conf', 0.0))
+
+    #     if conf >= solo_strong:
+    #         final_boxes.append(dict(yd, source='FINAL'))
+    #         LOGGER.debug("[YOLO SOLO STRONG] %s (>= %.2f) -> FINAL", det_str(yd), solo_strong)
+    #     elif f1_y > f1_f and conf >= conf_thresh:
+    #         final_boxes.append(dict(yd, source='FINAL'))
+    #         LOGGER.debug("[YOLO F1 ADVANTAGE] %s (f1_y=%.3f > f1_f=%.3f, conf>=%.2f) -> FINAL",
+    #                      det_str(yd), f1_y, f1_f, conf_thresh)
+    #     elif abs(f1_y - f1_f) <= f1_margin and conf >= near_tie_conf:
+    #         final_boxes.append(dict(yd, source='FINAL'))
+    #         LOGGER.debug("[YOLO CLOSE-F1 HI-CONF] %s (|ΔF1|<=%.2f, conf>=0.95) -> FINAL",
+    #                      det_str(yd), f1_margin)
+    #     else:
+    #         LOGGER.debug("[YOLO SOLO REJECT] %s", det_str(yd))
 
     # Step 3: solo (unmatched) FRCNN boxes
     for j, fd in enumerate(frc_ann):
