@@ -1,50 +1,88 @@
+# app.py
+# Goal:
+#   - Support exactly TWO detectors (generic) loaded from config.yaml["detectors"]
+#   - No hard-coded "yolov7"/"frcnn" assumptions anywhere
+#   - Use Pydantic models to manage config + voter params + detections
+#   - GUI edits voter params + per-model conf thresholds + F1 table
+#   - Persist changes back to the SAME config.yaml on disk (round-trip)
+#   - Debug/log output always includes *model names* (not framework names)
+#
+# Dependencies expected in project:
+#   - frame_inference.py provides MultiDetectorEngine with .run(frame)-> dict[name]->list[dict]
+#   - voter.py provides TwoModelVoter class (stateful) operating on DetectionModel / VoterParams
+#   - models.py provides Pydantic models: DetectionModel, VoterParams
+#
+# NOTE:
+#   - This refactor intentionally keeps the UX similar to your existing GUI.
+#   - It dynamically generates UI labels/columns based on the TWO selected detector names.
+
 from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
-import torch
-import sys
-import os
-import json
-import time
-import logging
-import re
-from collections import Counter, deque
-from typing import Optional, List, Any, Deque, Tuple, Dict
-
-from PySide6.QtCore import Qt, QTimer, QByteArray
-from PySide6.QtGui import (
-    QImage, QPixmap, QTextCursor, QTextOption, QAction,
-    QIcon, QPalette, QColor
-)
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFileDialog, QMessageBox, QStatusBar, QFrame,
-    QTextEdit, QSizePolicy, QLineEdit, QGroupBox, QGridLayout, QSpinBox,
-    QTableWidget, QTableWidgetItem, QAbstractItemView, QToolButton,
-    QDockWidget, QRadioButton, QButtonGroup, QDoubleSpinBox, QCheckBox
-)
-
-from yolov7.frame_inference import load_yolov7_model, detect_frame
-from fasterrcnn.frame_inference import load_fasterrcnn_model, run_fasterrcnn_on_frame
-from voter import (
-    load_f1_config as default_load_f1_config,
-    voter_merge as default_voter_merge,
-    draw_voter_boxes_on_frame as default_draw_voter_boxes_on_frame,
-    overlay_label as default_overlay_label,
-)
-
+import yaml
 from rich.logging import RichHandler
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction, QImage, QPalette, QColor, QTextCursor, QTextOption
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QDockWidget,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QSizePolicy,
+    QSpinBox,
+    QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+# use generic engine + voter + pydantic models
+from frame_inference import MultiDetectorEngine, available_providers
+from basemodels import DetectionModel, VoterParams  # pydantic models
+from voter import TwoModelVoter  # stateful two-model voter
 
 LOGGER = logging.getLogger("boardvision")
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True)]
+    handlers=[RichHandler(rich_tracebacks=True)],
 )
 
+# ----------------------------
+# Small utils
+# ----------------------------
+
 def human_ms(seconds: float) -> str:
-    return f"{seconds * 1000:.1f} ms"
+    return f"{seconds * 1000.0:.1f} ms"
+
 
 def safe_cap_set(cap: cv2.VideoCapture, prop, value) -> None:
     try:
@@ -52,20 +90,250 @@ def safe_cap_set(cap: cv2.VideoCapture, prop, value) -> None:
     except Exception:
         pass
 
+
+def _ensure_dir(p: str) -> None:
+    d = os.path.dirname(os.path.abspath(p))
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+
+def _deep_get(dct: dict, path: List[str], default=None):
+    cur = dct
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _deep_set(dct: dict, path: List[str], value):
+    cur = dct
+    for k in path[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[path[-1]] = value
+
+
+# ----------------------------
+# Drawing helpers
+# ----------------------------
+def draw_boxes(
+    frame_bgr: np.ndarray,
+    dets: List[Dict[str, Any]],
+    color=(0, 255, 0),
+) -> np.ndarray:
+    """
+    Draw bounding boxes with HIGH-VISIBILITY thickness and
+    auto-scaled labels based on image resolution.
+    """
+    img = frame_bgr.copy()
+    h, w = img.shape[:2]
+
+    # ---- VISIBILITY TUNING (KEY CHANGE) ----
+    base = min(w, h)
+
+    # Make boxes clearly visible even on 4K images
+    box_thickness = max(3, int(base / 400))     # ⬅️ THICKER BOXES
+    text_thickness = max(2, int(base / 700))
+    font_scale = max(0.6, base / 1000.0)
+    pad = max(6, int(base / 250))
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    for d in dets or []:
+        try:
+            x1, y1, x2, y2 = map(int, d["bbox"])
+            label = str(d.get("label", "?"))
+            conf = float(d.get("conf", 0.0))
+            src = str(d.get("source", ""))
+
+            text = f"{label} {conf:.2f}"
+            if src:
+                text += f" [{src}]"
+
+            # Clamp bbox
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
+
+            # ---- DRAW BOX (THICK & CLEAR) ----
+            cv2.rectangle(
+                img,
+                (x1, y1),
+                (x2, y2),
+                color,
+                box_thickness,
+            )
+
+            # ---- LABEL ----
+            (tw, th), baseline = cv2.getTextSize(
+                text,
+                font,
+                font_scale,
+                text_thickness,
+            )
+
+            y_text = max(th + pad, y1 - 8)
+            x_bg2 = min(w - 1, x1 + tw + pad * 2)
+            y_bg1 = y_text - th - baseline - pad
+            y_bg2 = y_text + pad
+
+            # White background
+            cv2.rectangle(
+                img,
+                (x1, y_bg1),
+                (x_bg2, y_bg2),
+                (255, 255, 255),
+                -1,
+            )
+
+            # Black text
+            cv2.putText(
+                img,
+                text,
+                (x1 + pad, y_text),
+                font,
+                font_scale,
+                (0, 0, 0),
+                text_thickness,
+                cv2.LINE_AA,
+            )
+
+        except Exception:
+            continue
+
+    return img
+
+# def draw_boxes(
+#     frame_bgr: np.ndarray,
+#     dets: List[Dict[str, Any]],
+#     color=(0, 255, 0),
+# ) -> np.ndarray:
+#     """
+#     Draw bounding boxes with label text that AUTO-SCALES
+#     based on image resolution.
+#     """
+#     img = frame_bgr.copy()
+#     h, w = img.shape[:2]
+
+#     # Scale text relative to image size
+#     base = min(w, h)
+#     font_scale = max(0.4, base / 1200.0)
+#     thickness = max(1, int(base / 800))
+#     pad = max(4, int(base / 300))
+
+#     font = cv2.FONT_HERSHEY_SIMPLEX
+
+#     for d in dets or []:
+#         try:
+#             x1, y1, x2, y2 = map(int, d["bbox"])
+#             label = str(d.get("label", "?"))
+#             conf = float(d.get("conf", 0.0))
+#             src = str(d.get("source", ""))
+
+#             text = f"{label} {conf:.2f}"
+#             if src:
+#                 text += f" [{src}]"
+
+#             # Clamp box
+#             x1 = max(0, min(w - 1, x1))
+#             y1 = max(0, min(h - 1, y1))
+#             x2 = max(0, min(w - 1, x2))
+#             y2 = max(0, min(h - 1, y2))
+
+#             cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+#             (tw, th), baseline = cv2.getTextSize(
+#                 text, font, font_scale, thickness
+#             )
+
+#             y_text = max(th + pad, y1 - 6)
+#             x_bg2 = min(w - 1, x1 + tw + pad * 2)
+#             y_bg1 = y_text - th - baseline - pad
+#             y_bg2 = y_text + pad
+
+#             # White label background
+#             cv2.rectangle(
+#                 img,
+#                 (x1, y_bg1),
+#                 (x_bg2, y_bg2),
+#                 (255, 255, 255),
+#                 -1,
+#             )
+
+#             # Black text
+#             cv2.putText(
+#                 img,
+#                 text,
+#                 (x1 + pad, y_text),
+#                 font,
+#                 font_scale,
+#                 (0, 0, 0),
+#                 thickness,
+#                 cv2.LINE_AA,
+#             )
+#         except Exception:
+#             continue
+
+#     return img
+
+def overlay_label(
+    img_bgr: np.ndarray,
+    text: str,
+    color=(255, 255, 255),
+) -> np.ndarray:
+    """
+    Overlay top-left title that scales with image resolution.
+    """
+    out = img_bgr.copy()
+    h, w = out.shape[:2]
+
+    base = min(w, h)
+    font_scale = max(0.6, base / 900.0)
+    thickness = max(2, int(base / 700))
+
+    cv2.putText(
+        out,
+        text,
+        (20, int(40 * font_scale)),
+        cv2.FONT_HERSHEY_DUPLEX,
+        font_scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+    return out
+
+
+
+# ----------------------------
+# Rolling stats
+# ----------------------------
+
 class RollingStats:
     def __init__(self, window: int = 60) -> None:
         self.times: Deque[float] = deque(maxlen=window)
+
     def add(self, seconds: float) -> None:
         self.times.append(max(1e-6, float(seconds)))
+
     @property
     def avg_ms(self) -> float:
         return (sum(self.times) / len(self.times)) * 1000.0 if self.times else 0.0
+
     @property
     def fps(self) -> float:
         if not self.times:
             return 0.0
         total = sum(self.times)
         return (len(self.times) / total) if total > 0 else 0.0
+
+
+# ----------------------------
+# UI Components
+# ----------------------------
 
 class Panel(QFrame):
     def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
@@ -80,114 +348,249 @@ class Panel(QFrame):
             QTextEdit { background: #0f0f0f; color: #ededed; border-top: 1px solid #2b2b2b; font-size: 13px; }
             """
         )
-        outer = QVBoxLayout(self); outer.setContentsMargins(12, 10, 12, 10); outer.setSpacing(6)
-        self.title = QLabel(title); self.title.setObjectName("Title"); self.title.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
-        self.stats = QLabel("-"); self.stats.setObjectName("Stats"); self.stats.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
-        self.video = QLabel(); self.video.setObjectName("Video"); self.video.setAlignment(Qt.AlignCenter)
-        self.video.setScaledContents(False); self.video.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setFixedHeight(140)
-        self.log.setLineWrapMode(QTextEdit.NoWrap); self.log.setWordWrapMode(QTextOption.NoWrap); self.log.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.log.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        outer.addWidget(self.title); outer.addWidget(self.stats); outer.addWidget(self.video, 1); outer.addWidget(self.log, 0)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(6)
+
+        self.title = QLabel(title)
+        self.title.setObjectName("Title")
+        self.title.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+
+        self.stats = QLabel("-")
+        self.stats.setObjectName("Stats")
+        self.stats.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+
+        self.video = QLabel()
+        self.video.setObjectName("Video")
+        self.video.setAlignment(Qt.AlignCenter)
+        self.video.setScaledContents(False)
+        self.video.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setFixedHeight(140)
+        self.log.setLineWrapMode(QTextEdit.NoWrap)
+        self.log.setWordWrapMode(QTextOption.NoWrap)
+
+        outer.addWidget(self.title)
+        outer.addWidget(self.stats)
+        outer.addWidget(self.video, 1)
+        outer.addWidget(self.log, 0)
+
     def set_stats(self, ms: float, fps: float) -> None:
         self.stats.setText("-" if (ms <= 0 and fps <= 0) else f"{ms:.1f} ms  |  {fps:.1f} FPS")
+
     def append_log(self, text: str) -> None:
-        self.log.append(text); self.log.moveCursor(QTextCursor.End)
+        self.log.append(text)
+        self.log.moveCursor(QTextCursor.End)
+
 
 class SettingsDock(QDockWidget):
-    def __init__(self, parent: "VideoInferenceWindow") -> None:
-        super().__init__("", parent)  # dock without title bar
+    """
+      Builds F1 table and model threshold controls dynamically for EXACTLY two models.
+      Exposes generic widgets keyed by model name.
+    """
+    def __init__(self, parent: VideoInferenceWindow, model_a: str, model_b: str) -> None:
+        super().__init__("", parent)
         self.setObjectName("SettingsDock")
         self.setAllowedAreas(Qt.LeftDockWidgetArea)
         self.setFeatures(QDockWidget.NoDockWidgetFeatures)
 
-        w = QWidget(self); self.setWidget(w)
-        root = QVBoxLayout(w); root.setContentsMargins(8, 8, 8, 8); root.setSpacing(10)
+        self.model_a = model_a
+        self.model_b = model_b
+
+        w = QWidget(self)
+        self.setWidget(w)
+        root = QVBoxLayout(w)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(10)
 
         # Controls
-        controls_grp = QGroupBox("Controls"); cl = QHBoxLayout(controls_grp)
-        self.btn_start_left = QPushButton("Start"); self.btn_stop_left = QPushButton("Stop")
+        controls_grp = QGroupBox("Controls")
+        cl = QHBoxLayout(controls_grp)
+        self.btn_start_left = QPushButton("Start")
+        self.btn_stop_left = QPushButton("Stop")
         for b, clr in ((self.btn_start_left, "#2e7dff"), (self.btn_stop_left, "#e23c3c")):
             b.setMinimumHeight(34)
-            b.setStyleSheet(f"QPushButton {{ background: {clr}; color: white; border: none; padding: 8px 16px; border-radius: 8px; font-size: 14px; }} QPushButton:disabled {{ background: #555; }}")
-        cl.addWidget(self.btn_start_left); cl.addWidget(self.btn_stop_left)
+            b.setStyleSheet(
+                f"QPushButton {{ background: {clr}; color: white; border: none; padding: 8px 16px; border-radius: 8px; font-size: 14px; }}"
+                f" QPushButton:disabled {{ background: #555; }}"
+            )
+        cl.addWidget(self.btn_start_left)
+        cl.addWidget(self.btn_stop_left)
         root.addWidget(controls_grp)
 
         # Source
-        src_grp = QGroupBox("Source"); gl = QGridLayout(src_grp)
+        src_grp = QGroupBox("Source")
+        gl = QGridLayout(src_grp)
         self.rb_file = QRadioButton("File")
         self.rb_stream = QRadioButton("Stream")
-        self.bg_source = QButtonGroup(self); self.bg_source.setExclusive(True)
-        self.bg_source.addButton(self.rb_file); self.bg_source.addButton(self.rb_stream)
-        gl.addWidget(self.rb_file, 0, 0); gl.addWidget(self.rb_stream, 0, 1, 1, 2)
-        self.le_file = QLineEdit(); self.le_file.setPlaceholderText("Video file path…")
-        self.btn_browse = QToolButton(); self.btn_browse.setText("Pick")
-        self.le_stream = QLineEdit(); self.le_stream.setPlaceholderText("Camera index (e.g., 0) or RTSP/HTTP URL")
-        gl.addWidget(QLabel("File:"),    1, 0); gl.addWidget(self.le_file, 1, 1); gl.addWidget(self.btn_browse, 1, 2)
-        gl.addWidget(QLabel("Stream:"),  2, 0); gl.addWidget(self.le_stream, 2, 1, 1, 2)
+        self.bg_source = QButtonGroup(self)
+        self.bg_source.setExclusive(True)
+        self.bg_source.addButton(self.rb_file)
+        self.bg_source.addButton(self.rb_stream)
+        gl.addWidget(self.rb_file, 0, 0)
+        gl.addWidget(self.rb_stream, 0, 1, 1, 2)
+        self.le_file = QLineEdit()
+        self.le_file.setPlaceholderText("Video file path…")
+        self.btn_browse = QToolButton()
+        self.btn_browse.setText("Pick")
+        self.le_stream = QLineEdit()
+        self.le_stream.setPlaceholderText("Camera index (e.g., 0) or RTSP/HTTP URL")
+        gl.addWidget(QLabel("File:"), 1, 0)
+        gl.addWidget(self.le_file, 1, 1)
+        gl.addWidget(self.btn_browse, 1, 2)
+        gl.addWidget(QLabel("Stream:"), 2, 0)
+        gl.addWidget(self.le_stream, 2, 1, 1, 2)
 
         # Performance
-        perf_grp = QGroupBox("Performance"); pl = QGridLayout(perf_grp)
-        self.sb_stride = QSpinBox(); self.sb_stride.setRange(1, 8); self.sb_stride.setValue(1)
-        pl.addWidget(QLabel("Stride (process every Nth frame):"), 0, 0); pl.addWidget(self.sb_stride, 0, 1)
+        perf_grp = QGroupBox("Performance")
+        pl = QGridLayout(perf_grp)
+        self.sb_stride = QSpinBox()
+        self.sb_stride.setRange(1, 16)
+        self.sb_stride.setValue(1)
+        pl.addWidget(QLabel("Stride (process every Nth frame):"), 0, 0)
+        pl.addWidget(self.sb_stride, 0, 1)
 
-        # Config path
-        cfg_path_grp = QGroupBox("Config File"); cl2 = QHBoxLayout(cfg_path_grp)
-        self.le_cfg_path = QLineEdit(); self.le_cfg_path.setPlaceholderText("config.json")
-        self.btn_cfg_browse = QToolButton(); self.btn_cfg_browse.setText("Pick")
-        cl2.addWidget(self.le_cfg_path, 1); cl2.addWidget(self.btn_cfg_browse, 0)
+        # Config file
+        cfg_path_grp = QGroupBox("Config File (YAML)")
+        cl2 = QHBoxLayout(cfg_path_grp)
+        self.le_cfg_path = QLineEdit()
+        self.le_cfg_path.setPlaceholderText("config.yaml")
+        self.btn_cfg_browse = QToolButton()
+        self.btn_cfg_browse.setText("Pick")
+        cl2.addWidget(self.le_cfg_path, 1)
+        cl2.addWidget(self.btn_cfg_browse, 0)
 
-        # Class Thresholds
-        cfg_grp = QGroupBox("Class Thresholds"); tbl_layout = QVBoxLayout(cfg_grp)
+        # F1 table (dynamic columns)
+        cfg_grp = QGroupBox("Per-class F1 Scores")
+        tbl_layout = QVBoxLayout(cfg_grp)
         self.tbl_cfg = QTableWidget(0, 3)
-        self.tbl_cfg.setHorizontalHeaderLabels(["Label", "YOLOv7", "FRCNN"])
+        self.tbl_cfg.setHorizontalHeaderLabels(["Label", self.model_a, self.model_b])
         self.tbl_cfg.horizontalHeader().setStretchLastSection(True)
         self.tbl_cfg.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.tbl_cfg.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
+        self.tbl_cfg.setEditTriggers(
+            QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed
+        )
         self.tbl_cfg.verticalHeader().setVisible(False)
+
         row_btns = QHBoxLayout()
         self.btn_add = QPushButton("Add Row")
         self.btn_del = QPushButton("Delete Selected")
         self.btn_reload = QPushButton("Reload")
-        self.btn_save = QPushButton("Save")
-        row_btns.addWidget(self.btn_add); row_btns.addWidget(self.btn_del); row_btns.addStretch(1); row_btns.addWidget(self.btn_reload); row_btns.addWidget(self.btn_save)
-        tbl_layout.addWidget(self.tbl_cfg); tbl_layout.addLayout(row_btns)
+        row_btns.addWidget(self.btn_add)
+        row_btns.addWidget(self.btn_del)
+        row_btns.addStretch(1)
+        row_btns.addWidget(self.btn_reload)
 
-        # Voter Parameters
-        vparams_grp = QGroupBox("Voter Parameters"); vp = QGridLayout(vparams_grp)
+        tbl_layout.addWidget(self.tbl_cfg)
+        tbl_layout.addLayout(row_btns)
+
+        # Voter parameters (pydantic-backed)
+        vparams_grp = QGroupBox("Voter Parameters")
+        vp = QGridLayout(vparams_grp)
+
         def mkdbl(minv, maxv, step, decimals=3):
-            w = QDoubleSpinBox(); w.setRange(minv, maxv); w.setSingleStep(step); w.setDecimals(decimals)
+            w = QDoubleSpinBox()
+            w.setRange(minv, maxv)
+            w.setSingleStep(step)
+            w.setDecimals(decimals)
             w.setAlignment(Qt.AlignRight)
             return w
-        self.ds_conf_thresh  = mkdbl(0.0, 1.0, 0.01)
-        self.ds_solo_strong  = mkdbl(0.0, 1.0, 0.01)
-        self.ds_iou_thresh   = mkdbl(0.0, 1.0, 0.01)
-        self.ds_f1_margin    = mkdbl(0.0, 1.0, 0.01)
-        self.ds_gamma        = mkdbl(0.1, 5.0, 0.1, decimals=2)
-        self.cb_fuse_coords  = QCheckBox("Fuse coordinates")
-        self.btn_voter_defaults = QToolButton(); self.btn_voter_defaults.setText("Reset")
+
+        self.ds_conf_thresh = mkdbl(0.0, 1.0, 0.01)
+        self.ds_solo_strong = mkdbl(0.0, 1.0, 0.01)
+        self.ds_iou_thresh = mkdbl(0.0, 1.0, 0.01)
+        self.ds_f1_margin = mkdbl(0.0, 1.0, 0.01)
+        self.ds_gamma = mkdbl(0.1, 10.0, 0.1, decimals=2)
+        self.ds_near_tie_conf = mkdbl(0.0, 1.0, 0.01)
+        self.cb_fuse_coords = QCheckBox("Fuse coordinates")
+        self.cb_use_f1 = QCheckBox("Use F1 weights")
+        self.btn_voter_defaults = QToolButton()
+        self.btn_voter_defaults.setText("Reset")
+
         row = 0
         vp.addWidget(QLabel("Base conf (conf_thresh):"), row, 0); vp.addWidget(self.ds_conf_thresh, row, 1); row += 1
         vp.addWidget(QLabel("Solo strong (solo_strong):"), row, 0); vp.addWidget(self.ds_solo_strong, row, 1); row += 1
         vp.addWidget(QLabel("IoU threshold (iou_thresh):"), row, 0); vp.addWidget(self.ds_iou_thresh, row, 1); row += 1
         vp.addWidget(QLabel("F1 margin (f1_margin):"), row, 0); vp.addWidget(self.ds_f1_margin, row, 1); row += 1
         vp.addWidget(QLabel("Gamma (gamma):"), row, 0); vp.addWidget(self.ds_gamma, row, 1); row += 1
+        vp.addWidget(QLabel("Near-tie conf (near_tie_conf):"), row, 0); vp.addWidget(self.ds_near_tie_conf, row, 1); row += 1
         vp.addWidget(self.cb_fuse_coords, row, 1); vp.addWidget(self.btn_voter_defaults, row, 2); row += 1
+        vp.addWidget(self.cb_use_f1, row, 1); row += 1
 
-        # Model Thresholds
-        model_grp = QGroupBox("Model Thresholds"); mg = QGridLayout(model_grp)
-        self.ds_yolo_conf  = mkdbl(0.0, 1.0, 0.01)
-        self.ds_frcnn_conf = mkdbl(0.0, 1.0, 0.01)
-        mg.addWidget(QLabel("YOLOv7 conf_thresh:"), 0, 0); mg.addWidget(self.ds_yolo_conf,  0, 1)
-        mg.addWidget(QLabel("Faster R-CNN conf_thresh:"), 1, 0); mg.addWidget(self.ds_frcnn_conf, 1, 1)
+        # Model thresholds (dynamic)
+        model_grp = QGroupBox("Model Thresholds")
+        mg = QGridLayout(model_grp)
+        self.model_conf_spins: Dict[str, QDoubleSpinBox] = {}
 
-        # Assemble dock
+        self.model_conf_spins[self.model_a] = mkdbl(0.0, 1.0, 0.01)
+        self.model_conf_spins[self.model_b] = mkdbl(0.0, 1.0, 0.01)
+
+        mg.addWidget(QLabel(f"{self.model_a} conf_threshold:"), 0, 0)
+        mg.addWidget(self.model_conf_spins[self.model_a], 0, 1)
+
+        mg.addWidget(QLabel(f"{self.model_b} conf_threshold:"), 1, 0)
+        mg.addWidget(self.model_conf_spins[self.model_b], 1, 1)
+
+        # assemble
         root.addWidget(src_grp)
         root.addWidget(perf_grp)
         root.addWidget(cfg_path_grp)
         root.addWidget(cfg_grp)
         root.addWidget(model_grp)
         root.addWidget(vparams_grp)
+
+        # ----------------------------
+        # Voter Info Box
+        # ----------------------------
+        info = QTextEdit()
+        info.setReadOnly(True)
+        info.setFixedHeight(110)
+        info.setStyleSheet(
+            """
+            QTextEdit {
+                background: #1a1a1a;
+                border: 1px solid #333;
+                border-radius: 8px;
+                color: #e0e0e0;
+                font-size: 12px;
+                padding: 8px;
+            }
+            """
+        )
+
+        info.setText(
+            "Voter Visualization:\n\n"
+            "• Grey boxes: All candidate detections from both models.\n"
+            "  These are shown for transparency and debugging.\n\n"
+            "• Yellow boxes: Final detections selected by the voter.\n"
+            "  These passed IoU, confidence, and F1-based rules."
+        )
+
+        root.addWidget(info)
+
+        # ----------------------------
+        # Save Configs button (moved)
+        # ----------------------------
+        self.btn_save = QPushButton("Save Configs")
+        self.btn_save.setMinimumHeight(38)
+        self.btn_save.setStyleSheet(
+            """
+            QPushButton {
+                background: #4caf50;
+                color: white;
+                font-weight: 700;
+                border-radius: 8px;
+                font-size: 14px;
+                padding: 10px;
+            }
+            QPushButton:hover {
+                background: #43a047;
+            }
+            """
+        )
+        root.addWidget(self.btn_save)
         root.addStretch(1)
 
         self.setStyleSheet(
@@ -203,20 +606,20 @@ class SettingsDock(QDockWidget):
             QTableWidget { background: #161616; color: #f0f0f0; gridline-color: #333; }
             QHeaderView::section { background: #202020; color: #f0f0f0; border: none; padding: 6px; }
             QPushButton, QToolButton { background: #2e7dff; color: white; border: none; padding: 6px 10px; border-radius: 6px; }
-            QPushButton#danger { background: #e23c3c; }
             QRadioButton { color: #e8e8e8; }
             QRadioButton::indicator { width: 16px; height: 16px; border-radius: 8px; border: 2px solid #6b7a86; background: #1d1d1d; }
             QRadioButton::indicator:checked { background: #2e7dff; border: 2px solid #9fb8ff; }
             """
         )
 
-        # Connections
+        # connect UI -> parent slots
         self.btn_browse.clicked.connect(parent._browse_file)
         self.btn_cfg_browse.clicked.connect(parent._browse_config)
         self.btn_add.clicked.connect(parent._cfg_add_row)
         self.btn_del.clicked.connect(parent._cfg_delete_rows)
         self.btn_reload.clicked.connect(parent._cfg_reload_from_disk)
         self.btn_save.clicked.connect(parent._cfg_save_to_disk)
+
         self.le_file.textChanged.connect(lambda s: parent._on_file_changed(s))
         self.le_stream.textChanged.connect(lambda s: parent._on_stream_changed(s))
         self.sb_stride.valueChanged.connect(lambda v: parent._on_stride_changed(v))
@@ -224,352 +627,389 @@ class SettingsDock(QDockWidget):
         self.rb_file.toggled.connect(lambda v: (parent._on_source_kind_changed("file") if v else None))
         self.rb_stream.toggled.connect(lambda v: (parent._on_source_kind_changed("stream") if v else None))
 
-        # Voter parameter signals
+        # voter params
         self.ds_conf_thresh.valueChanged.connect(lambda v: parent._on_voter_param_changed("conf_thresh", float(v)))
         self.ds_solo_strong.valueChanged.connect(lambda v: parent._on_voter_param_changed("solo_strong", float(v)))
         self.ds_iou_thresh.valueChanged.connect(lambda v: parent._on_voter_param_changed("iou_thresh", float(v)))
         self.ds_f1_margin.valueChanged.connect(lambda v: parent._on_voter_param_changed("f1_margin", float(v)))
         self.ds_gamma.valueChanged.connect(lambda v: parent._on_voter_param_changed("gamma", float(v)))
+        self.ds_near_tie_conf.valueChanged.connect(lambda v: parent._on_voter_param_changed("near_tie_conf", float(v)))
         self.cb_fuse_coords.toggled.connect(lambda v: parent._on_voter_param_changed("fuse_coords", bool(v)))
+        self.cb_use_f1.toggled.connect(lambda v: parent._on_voter_param_changed("use_f1", bool(v)))
         self.btn_voter_defaults.clicked.connect(parent._reset_voter_params)
 
-        # Model conf signals
-        self.ds_yolo_conf.valueChanged.connect(lambda v: parent._on_model_conf_changed("yolov7", float(v)))
-        self.ds_frcnn_conf.valueChanged.connect(lambda v: parent._on_model_conf_changed("frcnn", float(v)))
+        # model conf thresholds (generic)
+        self.model_conf_spins[self.model_a].valueChanged.connect(lambda v: parent._on_model_conf_changed(self.model_a, float(v)))
+        self.model_conf_spins[self.model_b].valueChanged.connect(lambda v: parent._on_model_conf_changed(self.model_b, float(v)))
 
     def set_source_mode(self, mode: str) -> None:
         if mode == "file":
             self.rb_file.setChecked(True)
-            self.le_file.setEnabled(True); self.btn_browse.setEnabled(True)
+            self.le_file.setEnabled(True)
+            self.btn_browse.setEnabled(True)
             self.le_stream.setEnabled(False)
         else:
             self.rb_stream.setChecked(True)
-            self.le_file.setEnabled(False); self.btn_browse.setEnabled(False)
+            self.le_file.setEnabled(False)
+            self.btn_browse.setEnabled(False)
             self.le_stream.setEnabled(True)
 
 
+# ----------------------------
+# Main window
+# ----------------------------
+
 class VideoInferenceWindow(QMainWindow):
-    def __init__(self) -> None:
+    """
+       Class Goals:
+       - Two detector names discovered from config dynamically
+       - No yolov7/frcnn naming anywhere
+       - Config is represented by Pydantic voter params (VoterParams)
+       - GUI updates voter + model thresholds + f1 scores, then persists to YAML
+       - Uses TwoModelVoter (stateful) that remembers model names + params
+    """
+    def __init__(self, config_path: str) -> None:
         super().__init__()
-        self.setWindowTitle("BoardVision – Live Inference")
+        self.setWindowTitle("BoardVision – Live Inference (Generic Two-Model)")
         self.resize(1350, 800)
 
-        self.device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        # video state
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_running: bool = False
         self.frame_index: int = 0
 
+        # ---- Cached images for resize re-render ----
+        self._last_img_a: Optional[np.ndarray] = None
+        self._last_img_b: Optional[np.ndarray] = None
+        self._last_img_voter: Optional[np.ndarray] = None
+
+        # source / perf
         self.video_path: str = ""
         self.stream_spec: str = "0"
         self.frame_stride: int = 1
-        self.config_path: str = "config.json"
+        self.config_path: str = config_path
         self.source_mode: str = "stream"
 
-        # Voter parameters (GUI-adjustable)
-        self.v_conf_thresh = 0.50
-        self.v_solo_strong = 0.95
-        self.v_iou_thresh  = 0.40
-        self.v_f1_margin   = 0.05
-        self.v_gamma       = 1.50
-        self.v_fuse_coords = True
+        # load yaml
+        self.cfg_raw: Dict[str, Any] = self._load_yaml_config(self.config_path)
 
-        # Model-level thresholds (GUI-adjustable)
-        self.m_yolo_conf  = 0.25
-        self.m_frcnn_conf = 0.50
+        # device / provider summary (kept)
+        pref = str((self.cfg_raw.get("device") or {}).get("preferred", "cuda")).lower()
+        gpu_id = int((self.cfg_raw.get("device") or {}).get("gpu_id", 0))
+        provs = available_providers()
+        if pref == "cuda" and "CUDAExecutionProvider" in provs:
+            self.device_str = f"cuda:{gpu_id}"
+        else:
+            self.device_str = "cpu"
 
+        # engine
+        LOGGER.info("Loading detectors (device=%s) …", self.device_str)
+        self.detector_engine = MultiDetectorEngine(self.cfg_raw)  # provides .detectors and .run()
+
+        # pick EXACTLY TWO detectors (first two enabled in YAML order)
+        self.detector_names: List[str] = list(self.detector_engine.detectors.keys())[:2]
+        if len(self.detector_names) != 2:
+            raise RuntimeError("Config must enable exactly two detectors for this GUI refactor.")
+        self.model_a: str = self.detector_names[0]
+        self.model_b: str = self.detector_names[1]
+
+        # pydantic voter params from YAML
+        self.voter_params: VoterParams = self._load_voter_params(self.cfg_raw)
+
+        # f1 scores from YAML (keys must match model names)
+        self.f1_scores: Dict[str, Dict[str, float]] = self._load_f1_scores(self.cfg_raw)
+
+        # model conf thresholds from YAML (generic)
+        self.model_conf: Dict[str, float] = {
+            self.model_a: float(_deep_get(self.cfg_raw, ["detectors", self.model_a, "conf_threshold"], 0.25)),
+            self.model_b: float(_deep_get(self.cfg_raw, ["detectors", self.model_b, "conf_threshold"], 0.25)),
+        }
+
+        # stateful voter
+        self.voter = TwoModelVoter(
+            model_a=self.model_a,
+            model_b=self.model_b,
+            f1_scores=self.f1_scores,
+            params=self.voter_params,
+        )
+
+        # stats (generic)
         self.stats_loop = RollingStats(120)
-        self.stats_yolo = RollingStats(120)
-        self.stats_frcnn = RollingStats(120)
+        self.stats_model = {self.model_a: RollingStats(120), self.model_b: RollingStats(120)}
         self.stats_decision = RollingStats(120)
 
-        LOGGER.info("Loading models (device=%s) …", self.device)
-        self.yolov7_model = load_yolov7_model("weights/yolov7.pt", device=self.device)
-        self.frcnn_model, self.frcnn_classes = load_fasterrcnn_model("weights/fasterrcnn.pth", device=self.device)
-
-        self.cfg_raw: Dict[str, Any] = self._load_config_file(self.config_path)
-        self.cfg_thresholds, _ = self._split_thresholds_and_meta(self.cfg_raw)
-
-        # Bind voter functions (no external import option)
-        self.fn_voter_merge = default_voter_merge
-        self.fn_draw_voter_boxes_on_frame = default_draw_voter_boxes_on_frame
-        self.fn_overlay_label = default_overlay_label
-
-        self._load_qsettings()
+        # build UI (dynamic model labels)
         self._build_ui()
-        self._connect_signals()
+
+        # timer
+        self.timer = QTimer(self)
+        self.timer.setInterval(0)
+        self.timer.timeout.connect(self._process_next_frame)
+
+        self._install_contrast_palette()
+        self.statusBar().showMessage(f"Device: {self.device_str} | Providers: {', '.join(provs)}")
+
+        # initialize UI from config
         self._sync_settings_to_ui()
 
-        self.timer = QTimer(self); self.timer.setInterval(0); self.timer.timeout.connect(self._process_next_frame)
-        self._install_contrast_palette()
-        self.statusBar().showMessage(f"Device: {self.device}")
+    # ----------------------------
+    # YAML + config helpers
+    # ----------------------------
+    def resizeEvent(self, event) -> None:
+        """
+        Qt resize hook.
+        Re-render images at the new widget size for crisp visuals.
+        """
+        super().resizeEvent(event)
+        self._rerender_cached_images()
+
+
+    def _load_yaml_config(self, path: str) -> dict:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            LOGGER.error("Failed to read YAML config '%s': %s", path, e)
+            return {}
+
+    def _save_yaml_config(self, path: str, cfg: dict) -> None:
+        _ensure_dir(path)
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=True)
+
+    def _load_f1_scores(self, cfg: dict) -> Dict[str, Dict[str, float]]:
+        """
+          Expects cfg["f1_scores"][label][<model_name>] floats
+          - We only care about the TWO active models, but we preserve other keys if present.
+        """
+        f1 = cfg.get("f1_scores")
+        out: Dict[str, Dict[str, float]] = {}
+        if isinstance(f1, dict):
+            for label, v in f1.items():
+                if isinstance(v, dict):
+                    out[str(label)] = {str(k): float(vv) for k, vv in v.items()}
+        return out
+
+    def _load_voter_params(self, cfg: dict) -> VoterParams:
+        """
+        Pydantic controls defaults + validation.
+        """
+        voter_cfg = cfg.get("voter", {}) or {}
+        try:
+            return VoterParams(**voter_cfg)
+        except Exception as e:
+            LOGGER.warning("Invalid voter config in YAML; using defaults. Error=%s", e)
+            return VoterParams()
+
+    # ----------------------------
+    # UI
+    # ----------------------------
 
     def _build_ui(self) -> None:
-        central = QWidget(self); self.setCentralWidget(central)
-        root = QVBoxLayout(central); root.setContentsMargins(10, 8, 10, 8); root.setSpacing(8)
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(8)
 
-        cols = QHBoxLayout(); cols.setSpacing(12)
-        self.panel_yolo = Panel("YOLOv7")
-        self.panel_voter = Panel("Decision (YOLO+FRCNN+Voter)")
-        self.panel_frcnn = Panel("Faster R-CNN")
-        cols.addWidget(self.panel_yolo, 1)
+        cols = QHBoxLayout()
+        cols.setSpacing(12)
+
+        # dynamic panels
+        self.panel_a = Panel(f"Detector: {self.model_a}")
+        self.panel_voter = Panel("Decision (Voter)")
+        self.panel_b = Panel(f"Detector: {self.model_b}")
+
+        cols.addWidget(self.panel_a, 1)
         cols.addWidget(self.panel_voter, 1)
-        cols.addWidget(self.panel_frcnn, 1)
-
+        cols.addWidget(self.panel_b, 1)
         root.addLayout(cols, 1)
 
-        self.settings_dock = SettingsDock(self)
+        # settings dock
+        self.settings_dock = SettingsDock(self, self.model_a, self.model_b)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.settings_dock)
 
+        # bind start/stop from dock
         self.btn_start = self.settings_dock.btn_start_left
         self.btn_stop = self.settings_dock.btn_stop_left
+        self.btn_start.clicked.connect(self.start)
+        self.btn_stop.clicked.connect(self.stop)
 
-        act_open_cfg = QAction("Open Config…", self); act_open_cfg.triggered.connect(self._browse_config)
-        act_save_cfg = QAction("Save Config", self);  act_save_cfg.triggered.connect(self._cfg_save_to_disk)
-        self.menuBar().addMenu("&Config").addActions([act_open_cfg, act_save_cfg])
-        self.menuBar().setStyleSheet(
-            "QMenuBar { background: #2a3439; color: #e6e6e6; border: none; }"
-            "QMenuBar::item { padding: 6px 10px; }"
-            "QMenuBar::item:selected { background: #3a454b; }"
-            "QMenu { background: #2a3439; color: #e6e6e6; border: 1px solid #3a3a3a; }"
-            "QMenu::item:selected { background: #3a454b; }"
-        )
-
-        self.setStyleSheet("QMainWindow { background: #101010; } QLabel { color: #f0f0f0; font-size: 14px; } QStatusBar { background: #0e0e0e; color: #e0e0e0; }")
-
-    def _connect_signals(self) -> None:
-        self.btn_start.clicked.connect(self._start_inference)
-        self.btn_stop.clicked.connect(self._stop_inference)
+        # status bar
+        self.setStatusBar(QStatusBar(self))
 
     def _install_contrast_palette(self) -> None:
-        pal = self.palette()
-        pal.setColor(QPalette.PlaceholderText, QColor("#b0b0b0"))
-        pal.setColor(QPalette.Text, QColor("#f0f0f0"))
-        pal.setColor(QPalette.WindowText, QColor("#f0f0f0"))
+        pal = QPalette()
+        pal.setColor(QPalette.Window, QColor("#121212"))
+        pal.setColor(QPalette.WindowText, QColor("#f2f2f2"))
+        pal.setColor(QPalette.Base, QColor("#121212"))
+        pal.setColor(QPalette.Text, QColor("#f2f2f2"))
+        pal.setColor(QPalette.Button, QColor("#2e7dff"))
+        pal.setColor(QPalette.ButtonText, QColor("#f2f2f2"))
         self.setPalette(pal)
 
-    def _file_dialog_options(self) -> QFileDialog.Options:
-        o = QFileDialog.Options()
-        o |= QFileDialog.DontUseNativeDialog
-        return o
-
-    def _load_qsettings(self) -> None:
-        from PySide6.QtCore import QSettings
-        s = QSettings("BoardVision", "GUI")
-        self.video_path  = s.value("source/file_path", self.video_path)
-        self.stream_spec = s.value("source/stream_spec", self.stream_spec)
-        try:
-            self.frame_stride = int(s.value("perf/stride", self.frame_stride))
-        except Exception:
-            pass
-        self.config_path = s.value("config/path", self.config_path)
-        self.source_mode = s.value("source/mode", self.source_mode)
-        geo = s.value("window/geometry"); st = s.value("window/state")
-        if isinstance(geo, QByteArray): self.restoreGeometry(geo)
-        if isinstance(st, QByteArray):  self.restoreState(st)
-
-        # Voter params
-        def _f(key, default):
-            try: return float(s.value(key, default))
-            except Exception: return default
-        self.v_conf_thresh = _f("voter/params/conf_thresh", self.v_conf_thresh)
-        self.v_solo_strong = _f("voter/params/solo_strong", self.v_solo_strong)
-        self.v_iou_thresh  = _f("voter/params/iou_thresh",  self.v_iou_thresh)
-        self.v_f1_margin   = _f("voter/params/f1_margin",   self.v_f1_margin)
-        self.v_gamma       = _f("voter/params/gamma",       self.v_gamma)
-        try:
-            self.v_fuse_coords = bool(s.value("voter/params/fuse_coords", self.v_fuse_coords, type=bool))
-        except Exception:
-            self.v_fuse_coords = str(s.value("voter/params/fuse_coords", self.v_fuse_coords)).lower() in ("1","true","yes","on")
-
-        # Model-level thresholds (persist)
-        self.m_yolo_conf  = _f("model/yolov7/conf_thresh", self.m_yolo_conf)
-        self.m_frcnn_conf = _f("model/frcnn/conf_thresh",  self.m_frcnn_conf)
-
-    def _save_qsettings(self) -> None:
-        from PySide6.QtCore import QSettings
-        s = QSettings("BoardVision", "GUI")
-        s.setValue("source/file_path", self.video_path)
-        s.setValue("source/stream_spec", self.stream_spec)
-        s.setValue("perf/stride", self.frame_stride)
-        s.setValue("config/path", self.config_path)
-        s.setValue("source/mode", self.source_mode)
-        s.setValue("window/geometry", self.saveGeometry())
-        s.setValue("window/state", self.saveState())
-        # Voter params
-        s.setValue("voter/params/conf_thresh", self.v_conf_thresh)
-        s.setValue("voter/params/solo_strong", self.v_solo_strong)
-        s.setValue("voter/params/iou_thresh",  self.v_iou_thresh)
-        s.setValue("voter/params/f1_margin",   self.v_f1_margin)
-        s.setValue("voter/params/gamma",       self.v_gamma)
-        s.setValue("voter/params/fuse_coords", self.v_fuse_coords)
-        # Model thresholds
-        s.setValue("model/yolov7/conf_thresh", self.m_yolo_conf)
-        s.setValue("model/frcnn/conf_thresh",  self.m_frcnn_conf)
-
-    def closeEvent(self, event) -> None:
-        try:
-            self._save_qsettings()
-            self._stop_inference()
-        finally:
-            super().closeEvent(event)
-
     def _sync_settings_to_ui(self) -> None:
-        d = self.settings_dock
-        d.le_file.setText(self.video_path)
-        d.le_stream.setText(self.stream_spec)
-        d.sb_stride.setValue(self.frame_stride)
-        d.le_cfg_path.setText(self.config_path)
-        d.set_source_mode(self.source_mode if self.source_mode in ("file", "stream") else ("file" if self.video_path else "stream"))
-        self._cfg_populate_table(self.cfg_thresholds)
+        # source + perf
+        self.settings_dock.le_cfg_path.setText(self.config_path)
+        self.settings_dock.sb_stride.setValue(int(self.frame_stride))
+        self.settings_dock.set_source_mode(self.source_mode)
+        self.settings_dock.le_file.setText(self.video_path)
+        self.settings_dock.le_stream.setText(self.stream_spec)
 
-        # Push voter params to the UI (without retrigger)
-        def _set(spin, val): spin.blockSignals(True); spin.setValue(val); spin.blockSignals(False)
-        _set(d.ds_conf_thresh, self.v_conf_thresh)
-        _set(d.ds_solo_strong, self.v_solo_strong)
-        _set(d.ds_iou_thresh,  self.v_iou_thresh)
-        _set(d.ds_f1_margin,   self.v_f1_margin)
-        _set(d.ds_gamma,       self.v_gamma)
-        d.cb_fuse_coords.blockSignals(True); d.cb_fuse_coords.setChecked(self.v_fuse_coords); d.cb_fuse_coords.blockSignals(False)
+        # voter params
+        vp = self.voter_params
+        self.settings_dock.ds_conf_thresh.setValue(float(vp.conf_thresh))
+        self.settings_dock.ds_solo_strong.setValue(float(vp.solo_strong))
+        self.settings_dock.ds_iou_thresh.setValue(float(vp.iou_thresh))
+        self.settings_dock.ds_f1_margin.setValue(float(vp.f1_margin))
+        self.settings_dock.ds_gamma.setValue(float(vp.gamma))
+        self.settings_dock.ds_near_tie_conf.setValue(float(vp.near_tie_conf))
+        self.settings_dock.cb_fuse_coords.setChecked(bool(vp.fuse_coords))
+        self.settings_dock.cb_use_f1.setChecked(bool(vp.use_f1))
 
-        # Push model thresholds to UI
-        _set(d.ds_yolo_conf,  self.m_yolo_conf)
-        _set(d.ds_frcnn_conf, self.m_frcnn_conf)
+        # model thresholds
+        self.settings_dock.model_conf_spins[self.model_a].setValue(float(self.model_conf[self.model_a]))
+        self.settings_dock.model_conf_spins[self.model_b].setValue(float(self.model_conf[self.model_b]))
 
-    def _on_source_kind_changed(self, kind: Optional[str]) -> None:
-        if kind in ("file", "stream"):
-            self.source_mode = kind
-            self._save_qsettings()
-            self.settings_dock.set_source_mode(kind)
+        # f1 table
+        self._cfg_populate_table(self.f1_scores)
 
-    def _on_file_changed(self, path: str) -> None:
-        self.video_path = path.strip(); self._save_qsettings()
-    def _on_stream_changed(self, spec: str) -> None:
-        self.stream_spec = spec.strip(); self._save_qsettings()
-    def _on_stride_changed(self, v: int) -> None:
-        self.frame_stride = int(v); self._save_qsettings()
-    def _on_cfg_path_changed(self, p: str) -> None:
-        self.config_path = p.strip(); self._save_qsettings()
+        # start/stop enabled state
+        self.btn_start.setEnabled(not self.is_running)
+        self.btn_stop.setEnabled(self.is_running)
 
-    def _on_voter_param_changed(self, name: str, value: Any) -> None:
-        # name in {"conf_thresh","solo_strong","iou_thresh","f1_margin","gamma","fuse_coords"}
-        setattr(self, f"v_{name}", value)
-        self._save_qsettings()
-        self.statusBar().showMessage(f"Voter param '{name}' set to {value}")
+    # ----------------------------
+    # File dialogs
+    # ----------------------------
 
-    # Unified handler for per-model conf_thresh
-    def _on_model_conf_changed(self, model: str, value: float) -> None:
-        if model == "yolov7":
-            self.m_yolo_conf = float(value)
-        elif model == "frcnn":
-            self.m_frcnn_conf = float(value)
-        else:
-            return
-        self._save_qsettings()
-        self.statusBar().showMessage(f"{model} conf_thresh set to {value:.2f}")
-
-    def _reset_voter_params(self) -> None:
-        self.v_conf_thresh = 0.50
-        self.v_solo_strong = 0.95
-        self.v_iou_thresh  = 0.40
-        self.v_f1_margin   = 0.05
-        self.v_gamma       = 1.50
-        self.v_fuse_coords = True
-        self._sync_settings_to_ui()
-        self._save_qsettings()
-        self.statusBar().showMessage("Voter parameters reset to defaults.")
+    def _file_dialog_options(self):
+        return QFileDialog.Options()
 
     def _browse_file(self) -> None:
-        from PySide6.QtWidgets import QFileDialog
-
-        media_filter = (
-            "Media Files (*.mp4 *.avi *.mov *.mkv "
-            "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
-        )
-        video_filter = "Video Files (*.mp4 *.avi *.mov *.mkv)"
-        image_filter = "Image Files (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
-        all_filter   = "All Files (*)"
-
+        media_filter = "Media (*.mp4 *.mov *.avi *.mkv *.webm *.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
         dlg = QFileDialog(self, "Select Video or Image")
         dlg.setOptions(self._file_dialog_options())
         dlg.setFileMode(QFileDialog.ExistingFile)
-        dlg.setNameFilters([media_filter, video_filter, image_filter, all_filter])
+        dlg.setNameFilters([media_filter, "All Files (*)"])
         dlg.selectNameFilter(media_filter)
 
         if dlg.exec():
             path = dlg.selectedFiles()[0]
             if path:
                 self.settings_dock.le_file.setText(path)
-                self.statusBar().showMessage(
-                    f"Selected: {os.path.basename(path)} - Device: {self.device}"
-                )
-
-
+                self.statusBar().showMessage(f"Selected: {os.path.basename(path)} | Device: {self.device_str}")
 
     def _browse_config(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select Config JSON", "", "JSON (*.json);;All Files (*)", options=self._file_dialog_options())
-        if path:
-            self.settings_dock.le_cfg_path.setText(path)
-            self.cfg_raw = self._load_config_file(path)
-            self.cfg_thresholds, _ = self._split_thresholds_and_meta(self.cfg_raw)
-            self._cfg_populate_table(self.cfg_thresholds)
-            self.statusBar().showMessage(f"Loaded config: {os.path.basename(path)}")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Config YAML",
+            "",
+            "YAML (*.yaml *.yml);All Files (*)",
+            options=self._file_dialog_options(),
+        )
+        if not path:
+            return
 
-    def _load_config_file(self, path: str) -> dict:
+        # reload config
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            self.config_path = path
+            self.cfg_raw = self._load_yaml_config(path)
+            self.detector_engine = MultiDetectorEngine(self.cfg_raw)
+
+            self.detector_names = list(self.detector_engine.detectors.keys())[:2]
+            if len(self.detector_names) != 2:
+                raise RuntimeError("Config must enable exactly two detectors for this GUI.")
+
+            # if model names changed, easiest is recreate the whole window
+            new_a, new_b = self.detector_names[0], self.detector_names[1]
+            if (new_a != self.model_a) or (new_b != self.model_b):
+                QMessageBox.information(
+                    self,
+                    "Config Loaded",
+                    "Detector names changed. Restarting window to rebuild dynamic UI.",
+                )
+                self.close()
+                # recreate
+                w = VideoInferenceWindow(path)
+                w.show()
+                return
+
+            self.voter_params = self._load_voter_params(self.cfg_raw)
+            self.f1_scores = self._load_f1_scores(self.cfg_raw)
+
+            self.model_conf[self.model_a] = float(_deep_get(self.cfg_raw, ["detectors", self.model_a, "conf_threshold"], self.model_conf[self.model_a]))
+            self.model_conf[self.model_b] = float(_deep_get(self.cfg_raw, ["detectors", self.model_b, "conf_threshold"], self.model_conf[self.model_b]))
+
+            # update voter instance with new config
+            self.voter = TwoModelVoter(self.model_a, self.model_b, self.f1_scores, self.voter_params)
+
+            self._sync_settings_to_ui()
+            self.statusBar().showMessage(f"Loaded config: {os.path.basename(path)}")
         except Exception as e:
-            LOGGER.warning("Failed to read config '%s': %s. Trying default loader.", path, e)
-            try:
-                return default_load_f1_config("config.json")
-            except Exception:
-                return {}
+            QMessageBox.critical(self, "Config Error", f"Failed to load config:\n{e}")
 
-    def _split_thresholds_and_meta(self, cfg: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Any]]:
-        thresholds: Dict[str, Dict[str, float]] = {}
-        meta: Dict[str, Any] = {}
-        for k, v in cfg.items():
-            if isinstance(v, dict) and any(key in v for key in ("YOLOv7", "FRCNN")):
-                thresholds[k] = v
-            else:
-                meta[k] = v
-        return thresholds, meta
+    # ----------------------------
+    # F1 table (yaml)
+    # ----------------------------
 
-    def _cfg_populate_table(self, thresholds: dict) -> None:
+    def _cfg_populate_table(self, f1_scores: dict) -> None:
+        """
+          - Uses columns [Label, model_a, model_b]
+          - Reads per-label f1_scores[label][model_a/model_b]
+        """
         tbl = self.settings_dock.tbl_cfg
         tbl.setRowCount(0)
-        for label, model_dict in thresholds.items():
-            row = tbl.rowCount(); tbl.insertRow(row)
+        for label, model_dict in (f1_scores or {}).items():
+            row = tbl.rowCount()
+            tbl.insertRow(row)
             tbl.setItem(row, 0, QTableWidgetItem(str(label)))
-            tbl.setItem(row, 1, QTableWidgetItem(str(model_dict.get("YOLOv7", ""))))
-            tbl.setItem(row, 2, QTableWidgetItem(str(model_dict.get("FRCNN", ""))))
+            tbl.setItem(row, 1, QTableWidgetItem(str((model_dict or {}).get(self.model_a, ""))))
+            tbl.setItem(row, 2, QTableWidgetItem(str((model_dict or {}).get(self.model_b, ""))))
 
     def _cfg_extract_from_table(self) -> dict:
+        """
+          - Extracts into cfg["f1_scores"][label][model_name]
+        """
         tbl = self.settings_dock.tbl_cfg
-        out = {}
+        out: Dict[str, Dict[str, float]] = {}
+
         for r in range(tbl.rowCount()):
-            label_item = tbl.item(r, 0); y_item = tbl.item(r, 1); f_item = tbl.item(r, 2)
+            label_item = tbl.item(r, 0)
+            a_item = tbl.item(r, 1)
+            b_item = tbl.item(r, 2)
+
             if not label_item:
                 continue
             label = label_item.text().strip()
             if not label:
                 continue
-            try:
-                yv = float(y_item.text()) if y_item and y_item.text() != "" else None
-            except Exception:
-                raise ValueError(f"Row {r+1}: YOLOv7 must be a number")
-            try:
-                fv = float(f_item.text()) if f_item and f_item.text() != "" else None
-            except Exception:
-                raise ValueError(f"Row {r+1}: FRCNN must be a number")
+
+            def parse_cell(item, col_name: str) -> Optional[float]:
+                if item is None:
+                    return None
+                txt = (item.text() or "").strip()
+                if txt == "":
+                    return None
+                try:
+                    return float(txt)
+                except Exception:
+                    raise ValueError(f"Row {r+1}: {col_name} must be a number")
+
+            av = parse_cell(a_item, self.model_a)
+            bv = parse_cell(b_item, self.model_b)
+
             out[label] = {}
-            if yv is not None: out[label]["YOLOv7"] = yv
-            if fv is not None: out[label]["FRCNN"] = fv
+            if av is not None:
+                out[label][self.model_a] = av
+            if bv is not None:
+                out[label][self.model_b] = bv
+
         return out
 
     def _cfg_add_row(self) -> None:
         tbl = self.settings_dock.tbl_cfg
-        row = tbl.rowCount(); tbl.insertRow(row)
+        row = tbl.rowCount()
+        tbl.insertRow(row)
         tbl.setItem(row, 0, QTableWidgetItem("New_Label"))
         tbl.setItem(row, 1, QTableWidgetItem("0.500"))
         tbl.setItem(row, 2, QTableWidgetItem("0.500"))
@@ -582,368 +1022,446 @@ class VideoInferenceWindow(QMainWindow):
 
     def _cfg_reload_from_disk(self) -> None:
         try:
-            self.cfg_raw = self._load_config_file(self.config_path)
+            self.cfg_raw = self._load_yaml_config(self.config_path)
+            self.f1_scores = self._load_f1_scores(self.cfg_raw)
+            self.voter_params = self._load_voter_params(self.cfg_raw)
+            # refresh voter object
+            self.voter = TwoModelVoter(self.model_a, self.model_b, self.f1_scores, self.voter_params)
         except Exception as e:
             QMessageBox.critical(self, "Config Error", f"Failed to read config:\n{e}")
             return
-        self.cfg_thresholds, _ = self._split_thresholds_and_meta(self.cfg_raw)
-        self._cfg_populate_table(self.cfg_thresholds)
+        self._sync_settings_to_ui()
         self.statusBar().showMessage("Reloaded config from disk.")
 
     def _cfg_save_to_disk(self) -> None:
         try:
-            thresholds = self._cfg_extract_from_table()
+            f1_new = self._cfg_extract_from_table()
         except Exception as e:
             QMessageBox.critical(self, "Validation Error", str(e))
             return
-        # Preserve any non-threshold metadata from the current cfg
-        _, meta = self._split_thresholds_and_meta(self.cfg_raw)
-        new_cfg = dict(meta)
-        new_cfg.update(thresholds)
+
+        # update in-memory yaml from pydantic + UI values
+        self.f1_scores = f1_new
+        self.voter.f1_scores = self.f1_scores  # keep voter in sync
+
+        self._write_back_config_to_yaml()
+
         try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(new_cfg, f, indent=2, sort_keys=True)
+            self._save_yaml_config(self.config_path, self.cfg_raw)
+            self.statusBar().showMessage("Saved config.yaml to disk.")
         except Exception as e:
-            QMessageBox.critical(self, "Write Error", f"Failed to write {self.config_path}:\n{e}")
-            return
-        self.cfg_raw = new_cfg
-        self.cfg_thresholds = thresholds
-        self.statusBar().showMessage(f"Saved config to {os.path.basename(self.config_path)}")
+            QMessageBox.critical(self, "Save Error", f"Failed to save YAML:\n{e}")
 
-    def _open_capture(self) -> Optional[cv2.VideoCapture]:
-        cap: Optional[cv2.VideoCapture] = None
-        if self.source_mode == "file":
-            if not self.video_path:
-                return None
-            cap = cv2.VideoCapture(self.video_path)
-        else:
-            if not self.stream_spec:
-                return None
-            try:
-                cam_idx = int(self.stream_spec)
-                cap = cv2.VideoCapture(cam_idx)
-            except Exception:
-                cap = cv2.VideoCapture(self.stream_spec)
-            safe_cap_set(cap, cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not cap or not cap.isOpened():
-            return None
-        return cap
+    # ----------------------------
+    # Settings changed handlers
+    # ----------------------------
 
-    def _start_inference(self) -> None:
+    def _on_file_changed(self, s: str) -> None:
+        self.video_path = s
+
+    def _on_stream_changed(self, s: str) -> None:
+        self.stream_spec = s
+
+    def _on_stride_changed(self, v: int) -> None:
+        self.frame_stride = int(v)
+
+    def _on_cfg_path_changed(self, s: str) -> None:
+        # keep but do not auto-load; browse button loads
+        self.config_path = s
+
+    def _on_source_kind_changed(self, mode: str) -> None:
+        self.source_mode = mode
+        self.settings_dock.set_source_mode(mode)
+
+    def _on_voter_param_changed(self, key: str, value: Any) -> None:
+        """
+           Updates pydantic voter params + voter instance
+           No direct primitive member variables
+        """
+        try:
+            data = self.voter_params.model_dump()
+            data[key] = value
+            self.voter_params = VoterParams(**data)  # validate
+            self.voter.params = self.voter_params
+        except Exception as e:
+            LOGGER.warning("Rejected voter param update: %s=%r (%s)", key, value, e)
+
+    def _reset_voter_params(self) -> None:
+        self.voter_params = VoterParams()
+        self.voter.params = self.voter_params
+        self._sync_settings_to_ui()
+
+    def _on_model_conf_changed(self, model_name: str, value: float) -> None:
+        """
+          Generic model threshold update
+          Updates engine runtime threshold + local state
+        """
+        self.model_conf[model_name] = float(value)
+        self.detector_engine.set_detector_conf(model_name, float(value))
+
+    # ----------------------------
+    # Persist changes back to YAML
+    # ----------------------------
+
+    def _write_back_config_to_yaml(self) -> None:
+        """
+          Writes current GUI state back into self.cfg_raw (original YAML dict)
+          - Preserves unknown keys/sections (does not overwrite whole file)
+        """
+        # voter section (pydantic → dict)
+        self.cfg_raw["voter"] = self.voter_params.model_dump()
+
+        # model conf thresholds
+        _deep_set(self.cfg_raw, ["detectors", self.model_a, "conf_threshold"], float(self.model_conf[self.model_a]))
+        _deep_set(self.cfg_raw, ["detectors", self.model_b, "conf_threshold"], float(self.model_conf[self.model_b]))
+
+        # f1 scores
+        self.cfg_raw["f1_scores"] = self.f1_scores
+
+    # ----------------------------
+    # Start/Stop
+    # ----------------------------
+
+    def start(self) -> None:
         if self.is_running:
             return
 
-        if self.source_mode == "file":
-            if not self.video_path:
-                QMessageBox.warning(self, "No Source", "Pick a file in the Settings panel.")
-                return
-            # If it's an image, do a single pass and return
-            if self._is_image_path(self.video_path):
-                img = cv2.imread(self.video_path)
-                if img is None:
-                    QMessageBox.critical(self, "Error", f"Failed to read image:\n{self.video_path}")
-                    return
-                self._clear_panel_logs()
-                LOGGER.info("Running single-image inference on %s", self.video_path)
-                self._run_inference_on_image(img)
+        # FORCE source mode from UI (important)
+        if self.settings_dock.rb_file.isChecked():
+            self.source_mode = "file"
+        elif self.settings_dock.rb_stream.isChecked():
+            self.source_mode = "stream"
+
+        # FIX: IMAGE FILES SHOULD NOT OPEN VideoCapture
+        if self.source_mode == "file" and self._is_image_path(self.video_path):
+            if not os.path.isfile(self.video_path):
+                QMessageBox.critical(self, "File Error", "Image file does not exist.")
                 return
 
-        if self.source_mode == "stream" and not self.stream_spec:
-            QMessageBox.warning(self, "No Source", "Enter a stream in the Settings panel.")
-            return
+            self.is_running = True
+            self.frame_index = 0
+            self.timer.start()
 
-        self.cap = self._open_capture()
-        if not self.cap:
-            QMessageBox.critical(self, "Error", "Failed to open source.")
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+
+            self.statusBar().showMessage(
+                f"Image mode | Models: {self.model_a}, {self.model_b}"
+            )
+            return  # 🚨 CRITICAL: do NOT open VideoCapture
+
+        # ---------- normal video / stream ----------
+        self._open_capture()
+        if self.cap is None or not self.cap.isOpened():
+            QMessageBox.critical(self, "Capture Error", "Failed to open video source.")
             return
 
         self.is_running = True
         self.frame_index = 0
-        self._clear_panel_logs()
-
         self.stats_loop = RollingStats(120)
-        self.stats_yolo = RollingStats(120)
-        self.stats_frcnn = RollingStats(120)
+        self.stats_model = {self.model_a: RollingStats(120), self.model_b: RollingStats(120)}
         self.stats_decision = RollingStats(120)
 
-        src_desc = self.video_path if self.source_mode == "file" else f"stream:{self.stream_spec}"
-        LOGGER.info("Starting inference on %s", src_desc)
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.timer.start()
 
+        self.statusBar().showMessage(
+            f"Running | Models: {self.model_a}, {self.model_b} | Device: {self.device_str}"
+        )
 
-    def _stop_inference(self) -> None:
+
+    def stop(self) -> None:
         if not self.is_running:
             return
         self.is_running = False
         self.timer.stop()
         if self.cap is not None:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except Exception:
+                pass
             self.cap = None
-        self.statusBar().showMessage(f"Stopped - Device: {self.device}")
-        LOGGER.info("Stopped inference.")
 
-    def _clear_panel_logs(self) -> None:
-        self.panel_yolo.log.clear(); self.panel_voter.log.clear(); self.panel_frcnn.log.clear()
-        self.panel_yolo.set_stats(0, 0); self.panel_frcnn.set_stats(0, 0); self.panel_voter.set_stats(0, 0)
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.statusBar().showMessage("Stopped.")
 
-    def _process_next_frame(self) -> None:
-        if not self.is_running or self.cap is None:
-            self.timer.stop(); return
+    def closeEvent(self, event) -> None:
+        self.stop()
+        super().closeEvent(event)
 
-        for _ in range(max(0, self.frame_stride - 1)):
-            _ = self.cap.grab()
-
-        t_loop_start = time.perf_counter()
-        ok, frame = self.cap.read()
-        if not ok or frame is None:
-            if self.source_mode == "file":
-                self._stop_inference()
-                QMessageBox.information(self, "Info", "End of video.")
-                LOGGER.info("Reached end of video after %d frames.", self.frame_index)
-            else:
-                LOGGER.warning("Stream read() failed; will retry…")
-            return
-
-        idx = self.frame_index; self.frame_index += 1
-        try:
-            t0 = time.perf_counter()
-            yolo_img, yolo_dets = detect_frame(
-                frame.copy(),
-                model=self.yolov7_model,
-                device=self.device,
-                conf_thresh=self.m_yolo_conf,
-            )
-            t1 = time.perf_counter(); yolo_dt = t1 - t0
-            self.stats_yolo.add(yolo_dt)
-            yolo_summary = self._summarize_dets(yolo_dets)
-            self.panel_yolo.append_log(f"#{idx:05d} {yolo_summary}  [{human_ms(yolo_dt)}]")
-            self.panel_yolo.set_stats(self.stats_yolo.avg_ms, self.stats_yolo.fps)
-
-            t0 = time.perf_counter()
-            frcnn_img, frcnn_dets = run_fasterrcnn_on_frame(
-                frame.copy(),
-                model=self.frcnn_model,
-                CLASSES=self.frcnn_classes,
-                device=self.device,
-                conf_thresh=self.m_frcnn_conf,
-            )
-            t1 = time.perf_counter(); frcnn_dt = t1 - t0
-            self.stats_frcnn.add(frcnn_dt)
-            frcnn_summary = self._summarize_dets(frcnn_dets, class_names=self.frcnn_classes)
-            self.panel_frcnn.append_log(f"#{idx:05d} {frcnn_summary}  [{human_ms(frcnn_dt)}]")
-            self.panel_frcnn.set_stats(self.stats_frcnn.avg_ms, self.stats_frcnn.fps)
-
-            t0 = time.perf_counter()
-            final_boxes, candidates = self.fn_voter_merge(
-                yolo_dets,
-                frcnn_dets,
-                self.cfg_thresholds,
-                conf_thresh=self.v_conf_thresh,
-                solo_strong=self.v_solo_strong,
-                iou_thresh=self.v_iou_thresh,
-                f1_margin=self.v_f1_margin,
-                gamma=self.v_gamma,
-                fuse_coords=self.v_fuse_coords,
-            )
-            voter_img = self.fn_draw_voter_boxes_on_frame(frame.copy(), final_boxes, candidates)
-            t1 = time.perf_counter(); voter_dt = t1 - t0
-
-            decision_dt = yolo_dt + frcnn_dt + voter_dt
-            self.stats_decision.add(decision_dt)
-
-            voter_summary = self._summarize_voter(final_boxes, candidates)
-            self.panel_voter.append_log(f"#{idx:05d} {voter_summary}  [voter={human_ms(voter_dt)}; decision={human_ms(decision_dt)}]")
-            self.panel_voter.set_stats(self.stats_decision.avg_ms, self.stats_decision.fps)
-
-            yolo_img = self.fn_overlay_label(yolo_img, "YOLOv7", color=(0, 128, 255))
-            frcnn_img = self.fn_overlay_label(frcnn_img, "Faster R-CNN", color=(255, 128, 0))
-            voter_img = self.fn_overlay_label(voter_img, "Decision", color=(0, 255, 255))
-            self._display_image(self.panel_yolo.video, yolo_img)
-            self._display_image(self.panel_voter.video, voter_img)
-            self._display_image(self.panel_frcnn.video, frcnn_img)
-
-            loop_dt = time.perf_counter() - t_loop_start
-            self.stats_loop.add(loop_dt)
-            src_fps = self.cap.get(cv2.CAP_PROP_FPS) or 0.0
-            msg = (
-                f"Device: {self.device} | Loop: {human_ms(self.stats_loop.avg_ms)} ({self.stats_loop.fps:.1f} FPS)"
-                f" | YOLO: {self.stats_yolo.avg_ms:.1f} ms ({self.stats_yolo.fps:.1f} FPS)"
-                f" | FRCNN: {self.stats_frcnn.avg_ms:.1f} ms ({self.stats_frcnn.fps:.1f} FPS)"
-                f" | Decision: {self.stats_decision.avg_ms:.1f} ms ({self.stats_decision.fps:.1f} FPS)"
-                + (f" | Source FPS: {src_fps:.1f}" if src_fps > 0 else "")
-                + (f" | Stride: {self.frame_stride}" if self.frame_stride > 1 else "")
-                + (
-                    f" | Voter: conf={self.v_conf_thresh:.2f}, solo={self.v_solo_strong:.2f}, "
-                    f"iou={self.v_iou_thresh:.2f}, f1={self.v_f1_margin:.2f}, "
-                    f"gamma={self.v_gamma:.2f}, fuse={self.v_fuse_coords}"
-                )
-                + (f" | Model conf: yolo={self.m_yolo_conf:.2f}, frcnn={self.m_frcnn_conf:.2f}")
-            )
-
-            self.statusBar().showMessage(msg)
-
-            LOGGER.info(
-                "F%05d | yolo=%s | frcnn=%s | voter=%s | decision=%s | loop=%s",
-                idx, human_ms(yolo_dt), human_ms(frcnn_dt), human_ms(voter_dt),
-                human_ms(decision_dt), human_ms(loop_dt)
-            )
-
-        except Exception as e:
-            self._stop_inference()
-            QMessageBox.critical(self, "Inference Error", f"Error during inference:\n{e}")
-            LOGGER.exception("Inference error on frame %d: %s", idx, e)
-
-    def _display_image(self, label: QLabel, bgr: np.ndarray) -> None:
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]; bytes_per_line = 3 * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        pm = QPixmap.fromImage(qimg)
-        scaled = pm.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label.setPixmap(scaled)
-
-    @staticmethod
-    def _summarize_dets(dets: Any, class_names: Optional[List[str]] = None) -> str:
-        n = 0; labels: List[str] = []; confs: List[float] = []
-        if dets is None: return "(no detections)"
-        try:
-            if isinstance(dets, (list, tuple)):
-                for d in dets:
-                    if isinstance(d, dict):
-                        n += 1
-                        lbl = d.get("label") or d.get("class") or d.get("cls")
-                        if isinstance(lbl, (int, np.integer)) and class_names and 0 <= int(lbl) < len(class_names):
-                            labels.append(class_names[int(lbl)])
-                        elif isinstance(lbl, str):
-                            labels.append(lbl)
-                        conf = d.get("conf") or d.get("score") or d.get("confidence")
-                        if isinstance(conf, (int, float, np.floating)): confs.append(float(conf))
-                    else:
-                        n += 1
-            else:
-                if hasattr(dets, "shape") and len(getattr(dets, "shape", [])) >= 1:
-                    n = int(dets.shape[0])
-                else:
-                    n = len(dets)
-        except Exception:
-            try: n = len(dets)
-            except Exception: n = 0
-        by_cls = Counter(labels)
-        cls_str = ", ".join(f"{k}:{v}" for k, v in sorted(by_cls.items())) if by_cls else "no det list"
-        if confs:
-            mean_conf = sum(confs) / max(len(confs), 1)
-            conf_str = f"avg_conf={mean_conf:.3f} max={max(confs):.3f}"
-        else:
-            conf_str = "avg_conf=NA"
-        return f"{n} dets ({cls_str}); {conf_str}"
-
-    @staticmethod
-    def _summarize_voter(final_boxes: Any, candidates: Any) -> str:
-        def _safe_len(x: Any) -> int:
-            try: return len(x) if x is not None else 0
-            except Exception: return 0
-        return f"fused={_safe_len(final_boxes)} (candidates={_safe_len(candidates)})"
+    # ----------------------------
+    # Capture open logic
+    # ----------------------------
 
     def _is_image_path(self, p: str) -> bool:
         ext = os.path.splitext(p)[1].lower()
         return ext in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
-    def _run_inference_on_image(self, frame_bgr: np.ndarray) -> None:
-        """Run one full pass on a single BGR image and update the three panels."""
-        idx = 0  # single-shot
+    def _open_capture(self) -> None:
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
-        # Fresh stats for a single pass
-        self.stats_yolo = RollingStats(1)
-        self.stats_frcnn = RollingStats(1)
-        self.stats_decision = RollingStats(1)
+        if self.source_mode == "file":
+            p = (self.video_path or "").strip()
+            if not p:
+                self.cap = None
+                return
+            if self._is_image_path(p):
+                # image "capture" handled by one-shot in process loop
+                self.cap = None
+                return
+            self.cap = cv2.VideoCapture(p)
+        else:
+            spec = (self.stream_spec or "0").strip()
+            # integer camera index?
+            if spec.isdigit():
+                self.cap = cv2.VideoCapture(int(spec))
+            else:
+                self.cap = cv2.VideoCapture(spec)
 
-        # YOLOv7
+        if self.cap is not None and self.cap.isOpened():
+            safe_cap_set(self.cap, cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    # ----------------------------
+    # Frame processing
+    # ----------------------------
+
+    def _display_image(self, label: QLabel, img_bgr: np.ndarray) -> None:
+        """
+        Correct, single-pass image scaling.
+        Proper QImage -> QPixmap conversion.
+        """
+        if img_bgr is None or img_bgr.size == 0:
+            return
+
+        # Convert BGR → RGB
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+
+        # Create QImage (backed by numpy memory)
+        qimg = QImage(
+            rgb.data,
+            w,
+            h,
+            rgb.strides[0],
+            QImage.Format_RGB888,
+        )
+
+        # Scale ONCE to QLabel size
+        qimg_scaled = qimg.scaled(
+            label.width(),
+            label.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+        # ✅ REQUIRED: convert to QPixmap
+        pixmap = QPixmap.fromImage(qimg_scaled)
+
+        label.setPixmap(pixmap)
+
+
+
+
+    def _summarize_dets(self, dets: List[Dict[str, Any]]) -> str:
+        n = len(dets or [])
+        return f"{n} dets"
+
+    def _summarize_voter(self, final_boxes: Any, candidates: Any) -> str:
+        def _safe_len(x: Any) -> int:
+            try:
+                return len(x) if x is not None else 0
+            except Exception:
+                return 0
+        return f"final={_safe_len(final_boxes)} (candidates={_safe_len(candidates)})"
+
+    def _convert_to_pydantic(self, dets: List[Dict[str, Any]], source_default: str) -> List[DetectionModel]:
+        out: List[DetectionModel] = []
+        for d in dets or []:
+            dd = dict(d)
+            dd.setdefault("source", source_default)
+            try:
+                out.append(DetectionModel(**dd))
+            except Exception:
+                # tolerate bad dets
+                continue
+        return out
+
+    def _process_next_frame(self) -> None:
+        if not self.is_running:
+            return
+
+        # image file one-shot
+        if self.source_mode == "file" and self._is_image_path(self.video_path):
+            try:
+                frame_bgr = cv2.imread(self.video_path)
+                if frame_bgr is None:
+                    raise RuntimeError("Failed to read image.")
+                self._run_inference_on_frame(frame_bgr, one_shot=True)
+                self.stop()
+            except Exception as e:
+                QMessageBox.critical(self, "Image Error", str(e))
+                self.stop()
+            return
+
+        if self.cap is None or not self.cap.isOpened():
+            self._open_capture()
+            if self.cap is None or not self.cap.isOpened():
+                self.stop()
+                return
+
+        # stride skip
+        self.frame_index += 1
+        if (self.frame_index % self.frame_stride) != 0:
+            return
+
+        ok, frame_bgr = self.cap.read()
+        if not ok or frame_bgr is None:
+            self.stop()
+            return
+
+        self._run_inference_on_frame(frame_bgr, one_shot=False)
+
+    def _run_inference_on_frame(self, frame_bgr: np.ndarray, one_shot: bool) -> None:
         t0 = time.perf_counter()
-        yolo_img, yolo_dets = detect_frame(
-            frame_bgr.copy(),
-            model=self.yolov7_model,
-            device=self.device,
-            conf_thresh=self.m_yolo_conf,
+
+        # run engine (dict model->list[dict])
+        # ---- per-model timing ----
+        det_out = {}
+        for name, detector in self.detector_engine.detectors.items():
+            t0m = time.perf_counter()
+            det_out[name] = detector.infer(frame_bgr.copy())
+            dtm = time.perf_counter() - t0m
+
+            if name in self.stats_model:
+                self.stats_model[name].add(dtm)
+
+
+        # extract model outputs (generic)
+        a_dets = det_out.get(self.model_a, [])
+        b_dets = det_out.get(self.model_b, [])
+
+        # update per-model stats (we can't measure inside engine per-model without timing; keep overall)
+        # You can add per-model timers later inside MultiDetectorEngine (future-proof).
+        t1 = time.perf_counter()
+
+        # voter expects pydantic dets
+        a_pd = self._convert_to_pydantic(a_dets, self.model_a)
+        b_pd = self._convert_to_pydantic(b_dets, self.model_b)
+
+        # vote
+        t2 = time.perf_counter()
+        final_pd, candidates_pd = self.voter.vote(a_pd, b_pd)
+        t3 = time.perf_counter()
+
+        # convert final back to dict for drawing
+        final_boxes = [d.model_dump() for d in final_pd]
+        candidates = [d.model_dump() for d in candidates_pd]
+
+        # render panels
+        a_img = draw_boxes(frame_bgr.copy(), a_dets, color=(0, 128, 255))
+        b_img = draw_boxes(frame_bgr.copy(), b_dets, color=(255, 128, 0))
+
+        # voter visualization: draw candidates lightly + finals strongly
+        voter_img = frame_bgr.copy()
+        voter_img = draw_boxes(voter_img, candidates, color=(80, 80, 80))
+        voter_img = draw_boxes(voter_img, final_boxes, color=(0, 255, 255))
+
+        #a_img = overlay_label(a_img, f"{self.model_a} (ONNX)", color=(0, 128, 255))
+        #b_img = overlay_label(b_img, f"{self.model_b} (ONNX)", color=(255, 128, 0))
+        #voter_img = overlay_label(voter_img, "Decision (Voter)", color=(0, 255, 255))
+        a_img = overlay_label(a_img, "", color=(0, 128, 255))
+        b_img = overlay_label(b_img, "", color=(255, 128, 0))
+        voter_img = overlay_label(voter_img, "", color=(0, 255, 255))
+
+
+        # ---- cache last rendered images (for resize re-render) ----
+        self._last_img_a = a_img
+        self._last_img_b = b_img
+        self._last_img_voter = voter_img
+
+        # display
+        self._display_image(self.panel_a.video, self._last_img_a)
+        self._display_image(self.panel_b.video, self._last_img_b)
+        self._display_image(self.panel_voter.video, self._last_img_voter)
+
+
+        # logs (include model names)
+        idx = self.frame_index
+        self.panel_a.append_log(f"#{idx:05d} [{self.model_a}] {self._summarize_dets(a_dets)}")
+        self.panel_b.append_log(f"#{idx:05d} [{self.model_b}] {self._summarize_dets(b_dets)}")
+        self.panel_voter.append_log(f"#{idx:05d} {self._summarize_voter(final_boxes, candidates)}")
+
+        # stats
+        loop_dt = time.perf_counter() - t0
+        self.stats_loop.add(loop_dt)
+        self.stats_decision.add(t3 - t2)
+
+        self.panel_a.set_stats(
+            self.stats_model[self.model_a].avg_ms,
+            self.stats_model[self.model_a].fps,
         )
-        t1 = time.perf_counter(); yolo_dt = t1 - t0
-        self.stats_yolo.add(yolo_dt)
-        yolo_summary = self._summarize_dets(yolo_dets)
-        self.panel_yolo.append_log(f"#{idx:05d} {yolo_summary}  [{human_ms(yolo_dt)}]")
-        self.panel_yolo.set_stats(self.stats_yolo.avg_ms, 0.0)
 
-        # Faster R-CNN
-        t0 = time.perf_counter()
-        frcnn_img, frcnn_dets = run_fasterrcnn_on_frame(
-            frame_bgr.copy(),
-            model=self.frcnn_model,
-            CLASSES=self.frcnn_classes,
-            device=self.device,
-            conf_thresh=self.m_frcnn_conf,
+        self.panel_b.set_stats(
+            self.stats_model[self.model_b].avg_ms,
+            self.stats_model[self.model_b].fps,
         )
-        t1 = time.perf_counter(); frcnn_dt = t1 - t0
-        self.stats_frcnn.add(frcnn_dt)
-        frcnn_summary = self._summarize_dets(frcnn_dets, class_names=self.frcnn_classes)
-        self.panel_frcnn.append_log(f"#{idx:05d} {frcnn_summary}  [{human_ms(frcnn_dt)}]")
-        self.panel_frcnn.set_stats(self.stats_frcnn.avg_ms, 0.0)
 
-        # Voter / Decision
-        t0 = time.perf_counter()
-        final_boxes, candidates = self.fn_voter_merge(
-            yolo_dets,
-            frcnn_dets,
-            self.cfg_thresholds,
-            conf_thresh=self.v_conf_thresh,
-            solo_strong=self.v_solo_strong,
-            iou_thresh=self.v_iou_thresh,
-            f1_margin=self.v_f1_margin,
-            gamma=self.v_gamma,
-            fuse_coords=self.v_fuse_coords,
+        self.panel_voter.set_stats(
+            self.stats_decision.avg_ms,
+            self.stats_loop.fps,   # voter FPS tied to loop
         )
-        voter_img = self.fn_draw_voter_boxes_on_frame(frame_bgr.copy(), final_boxes, candidates)
-        t1 = time.perf_counter(); voter_dt = t1 - t0
-        decision_dt = yolo_dt + frcnn_dt + voter_dt
-        self.stats_decision.add(decision_dt)
 
-        voter_summary = self._summarize_voter(final_boxes, candidates)
-        self.panel_voter.append_log(
-            f"#{idx:05d} {voter_summary}  [voter={human_ms(voter_dt)}; decision={human_ms(decision_dt)}]"
-        )
-        self.panel_voter.set_stats(self.stats_decision.avg_ms, 0.0)
 
-        # Labels & display
-        yolo_img  = self.fn_overlay_label(yolo_img,  "YOLOv7",      color=(0, 128, 255))
-        frcnn_img = self.fn_overlay_label(frcnn_img, "Faster R-CNN", color=(255, 128, 0))
-        voter_img = self.fn_overlay_label(voter_img, "Decision",     color=(0, 255, 255))
-        self._display_image(self.panel_yolo.video,  yolo_img)
-        self._display_image(self.panel_voter.video, voter_img)
-        self._display_image(self.panel_frcnn.video, frcnn_img)
-
+        # status bar debug
         self.statusBar().showMessage(
-            f"Image inference complete | YOLO {human_ms(yolo_dt)} | FRCNN {human_ms(frcnn_dt)} | Voter {human_ms(voter_dt)} | Device: {self.device}"
+            f"Models: {self.model_a}, {self.model_b} | "
+            f"Loop: {human_ms(loop_dt)} | Vote: {human_ms(t3-t2)} | "
+            f"Stride: {self.frame_stride} | Device: {self.device_str}"
         )
+
+        if one_shot:
+            LOGGER.info(
+                "Image inference done | models=[%s,%s] vote=%s",
+                self.model_a, self.model_b, self._summarize_voter(final_boxes, candidates)
+            )
+
+    def _rerender_cached_images(self) -> None:
+        """
+        Re-render last cached images when GUI resizes.
+        Does NOT re-run inference.
+        """
+        if self._last_img_a is not None:
+            self._display_image(self.panel_a.video, self._last_img_a)
+
+        if self._last_img_b is not None:
+            self._display_image(self.panel_b.video, self._last_img_b)
+
+        if self._last_img_voter is not None:
+            self._display_image(self.panel_voter.video, self._last_img_voter)
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="BoardVision ONNX GUI (Generic Two-Model)")
+    p.add_argument("--config", required=True, help="Path to config.yaml")
+    return p.parse_args(argv)
 
 
 def main() -> int:
+    args = parse_args(sys.argv[1:])
     app = QApplication(sys.argv)
-
-    pal = app.palette()
-    pal.setColor(QPalette.PlaceholderText, QColor("#b0b0b0"))
-    pal.setColor(QPalette.Text, QColor("#f0f0f0"))
-    pal.setColor(QPalette.WindowText, QColor("#f0f0f0"))
-    app.setPalette(pal)
-
-    win = VideoInferenceWindow()
-    win.show()
-
-    if sys.platform.startswith("win"): # Helps
-        try:
-            import ctypes
-            hwnd = int(win.winId())
-            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
-        except Exception:
-            pass
+    w = VideoInferenceWindow(args.config)
+    w.show()
     return app.exec()
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

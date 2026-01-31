@@ -1,0 +1,84 @@
+classes:
+- CPU_FAN_NO_Screws
+- CPU_FAN_Screw_loose
+- CPU_FAN_Screws
+- CPU_fan
+- CPU_fan_port
+- CPU_fan_port_detached
+- Incorrect_Screws
+- Loose_Screws
+- No_Screws
+- Scratch
+- Screws
+detectors:
+  yolov8:
+    conf_threshold: 0.6
+    enabled: true
+    input_size: 640
+    onnx_path: ./weights/miraclefactory/yolov8/yolov8.onnx
+    raw_weights_path: ./weights/miraclefactory/yolov8/yolov8.pt
+    type: yolo
+  yolov7:
+    conf_threshold: 0.6
+    enabled: true
+    input_size: 640
+    onnx_path: ./weights/miraclefactory/yolov7/yolov7.onnx
+    raw_weights_path: ./weights/miraclefactory/yolov7/yolov7.pt
+    type: yolo
+device:
+  gpu_id: 0
+  preferred: cuda
+f1_scores:
+  CPU_FAN_NO_Screws:
+    frcnn: 0.0
+    yolov7: 0.889
+    yolov8: 0.914
+  CPU_FAN_Screw_loose:
+    frcnn: 0.615
+    yolov7: 0.933
+    yolov8: 0.928
+  CPU_FAN_Screws:
+    frcnn: 0.971
+    yolov7: 1.0
+    yolov8: 0.992
+  CPU_fan:
+    frcnn: 1.0
+    yolov7: 0.971
+    yolov8: 1.0
+  CPU_fan_port:
+    frcnn: 0.788
+    yolov7: 0.97
+    yolov8: 0.939
+  CPU_fan_port_detached:
+    frcnn: 0.462
+    yolov7: 0.667
+    yolov8: 0.660
+  Incorrect_Screws:
+    frcnn: 0.5
+    yolov7: 0.8
+    yolov8: 0.844
+  Loose_Screws:
+    frcnn: 0.667
+    yolov7: 1.0
+    yolov8: 0.906
+  No_Screws:
+    frcnn: 0.842
+    yolov7: 0.933
+    yolov8: 0.887
+  Scratch:
+    frcnn: 0.9
+    yolov7: 0.9
+    yolov8: 0.951
+  Screws:
+    frcnn: 0.881
+    yolov7: 0.974
+    yolov8: 0.981
+voter:
+  conf_thresh: 0.6
+  solo_strong: 0.98
+  iou_thresh: 0.4
+  gamma: 2.0
+  f1_margin: 0.05
+  near_tie_conf: 0.90
+  fuse_coords: true
+  use_f1: true

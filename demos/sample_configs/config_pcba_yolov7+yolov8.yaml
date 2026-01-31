@@ -1,0 +1,77 @@
+classes:
+- Fan_Scratch
+- MB_Scratch
+- FanConnection_Missing
+- FanConnection_Loose
+- MBScrew_Loose
+- MBScrew_Missing
+- FanScrew_Loose
+- FanScrew_Missing
+detectors:
+  yolov8:
+    conf_threshold: 0.6
+    enabled: true
+    input_size: 640
+    onnx_path: null
+    raw_weights_path: ./weights/pcba/yolov8/yolov8.pt
+    type: yolo
+  yolov7:
+    conf_threshold: 0.6
+    enabled: true
+    input_size: 640
+    onnx_path: null
+    raw_weights_path: ./weights/pcba/yolov7/yolov7.pt
+    type: yolo
+device:
+  gpu_id: 0
+  preferred: cuda
+f1_scores:
+  Fan_Scratch:
+    yolov7: 0.995
+    frcnn: 0.969
+    yolov8: 0.971
+    rt_detrv2: 0.9803
+  MB_Scratch:
+    yolov7: 0.981
+    frcnn: 0.930
+    yolov8: 0.958
+    rt_detrv2: 0.9440
+  FanConnection_Missing:
+    yolov7: 0.976
+    frcnn: 0.844
+    yolov8: 0.969
+    rt_detrv2: 0.9520
+  FanConnection_Loose:
+    yolov7: 0.956
+    frcnn: 0.843
+    yolov8: 0.960
+    rt_detrv2: 0.9286
+  MBScrew_Loose:
+    yolov7: 0.973
+    frcnn: 0.853
+    yolov8: 0.965
+    rt_detrv2: 0.9393
+  MBScrew_Missing:
+    yolov7: 0.949
+    frcnn: 0.889
+    yolov8: 0.962
+    rt_detrv2: 0.9115
+  FanScrew_Loose:
+    yolov7: 0.897
+    frcnn: 0.504
+    yolov8: 0.836
+    rt_detrv2: 0.9026
+  FanScrew_Missing:
+    yolov7: 0.955
+    frcnn: 0.825
+    yolov8: 0.927
+    rt_detrv2: 0.8324
+voter:
+  conf_thresh: 0.6
+  solo_strong: 0.98
+  iou_thresh: 0.4
+  gamma: 1.0
+  f1_margin: 0.05
+  near_tie_conf: 0.90
+  fuse_coords: true
+  use_f1: true

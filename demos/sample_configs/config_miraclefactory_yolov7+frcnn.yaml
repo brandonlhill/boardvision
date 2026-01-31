@@ -1,0 +1,79 @@
+classes:
+- CPU_FAN_NO_Screws
+- CPU_FAN_Screw_loose
+- CPU_FAN_Screws
+- CPU_fan
+- CPU_fan_port
+- CPU_fan_port_detached
+- Incorrect_Screws
+- Loose_Screws
+- No_Screws
+- Scratch
+- Screws
+detectors:
+  frcnn:
+    conf_threshold: 0.95
+    enabled: true
+    input_size: 640
+    onnx_path: ./weights/miraclefactory/fasterrcnn/fasterrcnn.onnx
+    raw_weights_path: ./weights/miraclefactory/fasterrcnn/fasterrcnn.pth
+    type: frcnn
+  yolov7:
+    conf_threshold: 0.6
+    enabled: true
+    input_size: 640
+    onnx_path: ./weights/miraclefactory/yolov7/yolov7.onnx
+    raw_weights_path: ./weights/miraclefactory/yolov7/yolov7.pt
+    type: yolo
+device:
+  gpu_id: 0
+  preferred: cuda
+f1_scores: # Computed from validation + test datasets
+  CPU_FAN_NO_Screws:
+    frcnn: 0.000
+    yolov7: 0.414
+  CPU_FAN_Screw_loose:
+    frcnn: 0.800
+    yolov7: 0.783
+  CPU_FAN_Screws:
+    frcnn: 0.979
+    yolov7: 0.968
+  CPU_fan:
+    frcnn: 0.958
+    yolov7: 0.980
+  CPU_fan_port:
+    frcnn: 0.737
+    yolov7: 1.000
+  CPU_fan_port_detached:
+    frcnn: 0.667
+    yolov7: 0.600
+  Incorrect_Screws:
+    frcnn: 0.857
+    yolov7: 1.000
+  Loose_Screws:
+    frcnn: 0.800
+    yolov7: 0.800
+  No_Screws:
+    frcnn: 0.878
+    yolov7: 0.976
+  Scratch:
+    frcnn: 0.727
+    yolov7: 0.667
+  Screws:
+    frcnn: 0.904
+    yolov7: 0.984
+
+voter:
+  conf_thresh: 0.9
+  solo_strong: 0.95
+  iou_thresh: 0.5
+  gamma: 0.5
+  f1_margin: 0.05
+  near_tie_conf: 0.95
+  fuse_coords: true
+  use_f1: true
+wbf:
+  enabled: true
+  iou_thr: 0.60
+  skip_box_thr: 0.001
+  weights: [1.0, 2.0]   # [weight_for_model_A, weight_for_model_B]
